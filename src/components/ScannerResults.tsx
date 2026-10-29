@@ -64,6 +64,10 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const downloadControllerRef = useRef<AbortController | null>(null);
     const latencyControllerRef = useRef<AbortController | null>(null);
     const filterInitialized = useRef(false);
+    const regionFilterTouched = useRef(false);
+    const portFilterTouched = useRef(false);
+    const knownRegionsRef = useRef(new Set<string>());
+    const knownPortsRef = useRef(new Set<string>());
 
     const resultsWithLatency = scanResults.map(result => {
         const measurement = latencyMeasurements[getResultKey(result)];
@@ -80,14 +84,33 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const uniqueRegions: string[] = Array.from(new Set(resultsWithLatency.map(r => r.colo))).filter((r): r is string => !!r).sort();
     const uniquePorts: number[] = Array.from(new Set(resultsWithLatency.map(r => r.port))).sort((a, b) => a - b);
 
-    // 结果首次就绪时，默认将全部地区/端口选入集合（真正全选，而非空集代表全选）
+    const regionOptionsKey = uniqueRegions.join('\0');
+    const portOptionsKey = uniquePorts.map(String).join('\0');
+
+    // Keep newly discovered options selected while each filter remains in its default all-selected mode.
     useEffect(() => {
-        if (!filterInitialized.current && uniqueRegions.length > 0) {
+        if (scanResults.length === 0) return;
+
+        const availablePorts = uniquePorts.map(String);
+        const newRegions = uniqueRegions.filter(region => !knownRegionsRef.current.has(region));
+        const newPorts = availablePorts.filter(port => !knownPortsRef.current.has(port));
+
+        if (!filterInitialized.current && (uniqueRegions.length > 0 || availablePorts.length > 0)) {
             setSelectedRegions(new Set(uniqueRegions));
-            setSelectedPorts(new Set(uniquePorts.map(String)));
+            setSelectedPorts(new Set(availablePorts));
             filterInitialized.current = true;
+        } else {
+            if (!regionFilterTouched.current && newRegions.length > 0) {
+                setSelectedRegions(previous => new Set([...previous, ...newRegions]));
+            }
+            if (!portFilterTouched.current && newPorts.length > 0) {
+                setSelectedPorts(previous => new Set([...previous, ...newPorts]));
+            }
         }
-    }, [uniqueRegions, uniquePorts]);
+
+        knownRegionsRef.current = new Set(uniqueRegions);
+        knownPortsRef.current = new Set(availablePorts);
+    }, [scanResults.length, regionOptionsKey, portOptionsKey]);
 
     // 加载已保存场景名列表，供场景录入框快速选择
     useEffect(() => {
@@ -217,9 +240,16 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     useEffect(() => {
         if (scanResults.length > 0) return;
         setSelectedResults(new Set());
+        setSelectedRegions(new Set());
+        setSelectedPorts(new Set());
         setLatencyMeasurements({});
         setDownloadMeasurements({});
         setResultSortMode('latency');
+        filterInitialized.current = false;
+        regionFilterTouched.current = false;
+        portFilterTouched.current = false;
+        knownRegionsRef.current.clear();
+        knownPortsRef.current.clear();
         downloadControllerRef.current?.abort();
         latencyControllerRef.current?.abort();
     }, [scanResults]);
@@ -525,13 +555,19 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                             <h3 className="text-sm font-bold text-gray-700 dark:text-gray-200">按地区筛选</h3>
                             <div className="flex items-center gap-3">
                                 <button 
-                                    onClick={() => setSelectedRegions(new Set(uniqueRegions))}
+                                    onClick={() => {
+                                        regionFilterTouched.current = false;
+                                        setSelectedRegions(new Set(uniqueRegions));
+                                    }}
                                     className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
                                 >
                                     全选
                                 </button>
                                 <button 
-                                    onClick={() => setSelectedRegions(new Set())}
+                                    onClick={() => {
+                                        regionFilterTouched.current = true;
+                                        setSelectedRegions(new Set());
+                                    }}
                                     className="px-3 py-1 text-xs font-medium text-gray-800 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors"
                                 >
                                     清空
@@ -548,6 +584,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                         key={region}
                                         type="button"
                                         onClick={() => {
+                                            regionFilterTouched.current = true;
                                             const newSet = new Set(selectedRegions);
                                             if (newSet.has(region)) {
                                                 newSet.delete(region);
@@ -572,13 +609,19 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                             <h3 className="text-sm font-bold text-gray-700 dark:text-gray-200">按端口筛选</h3>
                             <div className="flex items-center gap-3">
                                 <button
-                                    onClick={() => setSelectedPorts(new Set(uniquePorts.map(String)))}
+                                    onClick={() => {
+                                        portFilterTouched.current = false;
+                                        setSelectedPorts(new Set(uniquePorts.map(String)));
+                                    }}
                                     className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
                                 >
                                     全选
                                 </button>
                                 <button
-                                    onClick={() => setSelectedPorts(new Set())}
+                                    onClick={() => {
+                                        portFilterTouched.current = true;
+                                        setSelectedPorts(new Set());
+                                    }}
                                     className="px-3 py-1 text-xs font-medium text-gray-800 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors"
                                 >
                                     清空
@@ -594,6 +637,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                         key={port}
                                         type="button"
                                         onClick={() => {
+                                            portFilterTouched.current = true;
                                             const newSet = new Set(selectedPorts);
                                             if (newSet.has(portStr)) {
                                                 newSet.delete(portStr);
