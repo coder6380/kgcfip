@@ -2,11 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { saveResults, getScenes } from '../api';
 import {
   ScanResult,
+  BROWSER_LATENCY_TIMEOUT_MS,
   getLatencyColor,
   measureIpDownloadSpeed,
+  measureIpLatency,
 } from '../utils/scanner';
 import { useToast } from './Toast';
-import { Gauge, ListFilter, Save, StopCircle } from 'lucide-react';
+import { Gauge, ListFilter, RefreshCw, Save, StopCircle } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
 
 interface IpScannerResultsAndSaveProps {
@@ -18,6 +20,12 @@ const DEFAULT_IPS_PER_REGION = 20;
 type DownloadMeasurement = {
     status: 'pending' | 'testing' | 'done' | 'error';
     speed?: number;
+    error?: string;
+};
+type LatencyMeasurement = {
+    status: 'pending' | 'testing' | 'done';
+    latency?: number;
+    colo?: string;
     error?: string;
 };
 
@@ -46,11 +54,28 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const [downloadProgress, setDownloadProgress] = useState({ completed: 0, total: 0, currentIp: '' });
     const [downloadTestMessage, setDownloadTestMessage] = useState('');
     const [downloadMeasurements, setDownloadMeasurements] = useState<Record<string, DownloadMeasurement>>({});
+    const [isLatencyTesting, setIsLatencyTesting] = useState(false);
+    const [latencyProgress, setLatencyProgress] = useState({ completed: 0, total: 0, currentIp: '' });
+    const [latencyTestMessage, setLatencyTestMessage] = useState('');
+    const [latencyMeasurements, setLatencyMeasurements] = useState<Record<string, LatencyMeasurement>>({});
     const downloadControllerRef = useRef<AbortController | null>(null);
+    const latencyControllerRef = useRef<AbortController | null>(null);
     const filterInitialized = useRef(false);
 
-    const uniqueRegions: string[] = Array.from(new Set(scanResults.map(r => r.colo))).filter((r): r is string => !!r).sort();
-    const uniquePorts: number[] = Array.from(new Set(scanResults.map(r => r.port))).sort((a, b) => a - b);
+    const resultsWithLatency = scanResults.map(result => {
+        const measurement = latencyMeasurements[getResultKey(result)];
+        if (measurement?.status !== 'done') return result;
+        return {
+            ...result,
+            latency: measurement.latency ?? -1,
+            colo: measurement.latency && measurement.latency > 0 && measurement.colo && measurement.colo !== '-'
+                ? measurement.colo
+                : result.colo,
+            error: measurement.error,
+        };
+    });
+    const uniqueRegions: string[] = Array.from(new Set(resultsWithLatency.map(r => r.colo))).filter((r): r is string => !!r).sort();
+    const uniquePorts: number[] = Array.from(new Set(resultsWithLatency.map(r => r.port))).sort((a, b) => a - b);
 
     // 结果首次就绪时，默认将全部地区/端口选入集合（真正全选，而非空集代表全选）
     useEffect(() => {
@@ -101,7 +126,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         && Number.isFinite(minimumDownloadSpeedValue)
         && minimumDownloadSpeedValue >= 0;
 
-    const baseFilteredResults = scanResults.filter(r => isLatencyFilterEnabled
+    const baseFilteredResults = resultsWithLatency.filter(r => isLatencyFilterEnabled
         ? (isLatencyFormatValid && r.latency > -1 && r.latency <= effectiveLatencyValue)
         : true
     );
@@ -154,13 +179,21 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         return isMinimumDownloadSpeedValid && typeof speed === 'number' && speed >= minimumDownloadSpeedValue;
     });
     const selectedVisibleResults = limitedResults.filter(result => selectedResults.has(getResultKey(result)));
+    const latencyTestTargets = selectedVisibleResults.length > 0 ? selectedVisibleResults : limitedResults;
     const areAllVisibleResultsSelected = limitedResults.length > 0
         && limitedResults.every(result => selectedResults.has(getResultKey(result)));
 
     const { showToast } = useToast();
 
-    useEffect(() => () => downloadControllerRef.current?.abort(), []);
-    useEffect(() => setSelectedResults(new Set()), [scanResults]);
+    useEffect(() => () => {
+        downloadControllerRef.current?.abort();
+        latencyControllerRef.current?.abort();
+    }, []);
+    useEffect(() => {
+        setSelectedResults(new Set());
+        setLatencyMeasurements({});
+        latencyControllerRef.current?.abort();
+    }, [scanResults]);
 
     const handleDownloadSpeedTest = async () => {
         const targets = [...regionLimitedResults];
@@ -234,6 +267,91 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     };
 
     const handleStopDownloadTest = () => downloadControllerRef.current?.abort();
+    const handleStopLatencyTest = () => latencyControllerRef.current?.abort();
+
+    const handleLatencyTest = async () => {
+        if (isDownloadTesting || isLatencyTesting) return;
+        const targets = [...latencyTestTargets];
+        if (targets.length === 0) {
+            showToast('当前筛选列表没有可复测的 IP', 'warning');
+            return;
+        }
+
+        const controller = new AbortController();
+        latencyControllerRef.current = controller;
+        setIsLatencyTesting(true);
+        setLatencyTestMessage('');
+        setLatencyProgress({ completed: 0, total: targets.length, currentIp: '' });
+        setLatencyMeasurements(previous => {
+            const next = { ...previous };
+            targets.forEach(result => { next[getResultKey(result)] = { status: 'pending' }; });
+            return next;
+        });
+
+        const completedMeasurements = new Map<string, LatencyMeasurement>();
+        let cursor = 0;
+        let completed = 0;
+        try {
+            const worker = async () => {
+                while (!controller.signal.aborted) {
+                    const result = targets[cursor++];
+                    if (!result) return;
+
+                    const key = getResultKey(result);
+                    setLatencyProgress(previous => ({ ...previous, currentIp: result.ip }));
+                    setLatencyMeasurements(previous => ({ ...previous, [key]: { status: 'testing' } }));
+
+                    try {
+                        const measurement = await measureIpLatency(
+                            result.ip,
+                            result.port,
+                            BROWSER_LATENCY_TIMEOUT_MS,
+                            controller.signal,
+                        );
+                        if (controller.signal.aborted) return;
+                        const value: LatencyMeasurement = { status: 'done', ...measurement };
+                        completedMeasurements.set(key, value);
+                        setLatencyMeasurements(previous => ({ ...previous, [key]: value }));
+                    } catch (error) {
+                        if (controller.signal.aborted) return;
+                        const value: LatencyMeasurement = {
+                            status: 'done',
+                            latency: -1,
+                            error: error instanceof Error ? error.message : '测速失败',
+                        };
+                        completedMeasurements.set(key, value);
+                        setLatencyMeasurements(previous => ({ ...previous, [key]: value }));
+                    }
+
+                    completed++;
+                    setLatencyProgress({ completed, total: targets.length, currentIp: '' });
+                }
+            };
+
+            await Promise.all(Array.from({ length: Math.min(8, targets.length) }, () => worker()));
+            if (controller.signal.aborted) {
+                setLatencyMeasurements(previous => {
+                    const next = { ...previous };
+                    targets.forEach(result => {
+                        const key = getResultKey(result);
+                        if (next[key]?.status === 'pending' || next[key]?.status === 'testing') delete next[key];
+                    });
+                    return next;
+                });
+            }
+
+            setLatencyProgress({ completed, total: targets.length, currentIp: '' });
+            const stoppedMessage = controller.signal.aborted ? `已停止，完成 ${completed}/${targets.length}` : '';
+            const completedCount = completedMeasurements.size;
+            setLatencyTestMessage(stoppedMessage || `延迟复测完成，更新 ${completedCount} 条`);
+            if (completedCount > 0) {
+                showToast(stoppedMessage || `延迟复测完成，更新 ${completedCount} 条`, 'success');
+            }
+        } finally {
+            latencyControllerRef.current = null;
+            setIsLatencyTesting(false);
+        }
+    };
 
     const handleSave = async () => {
         if (selectedVisibleResults.length === 0) {
@@ -465,47 +583,78 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                             })}
                         </div>
                     </div>
-                    <div className="flex flex-wrap items-center gap-3 mb-3">
-                        <label htmlFor="download-test-duration" className="text-sm text-gray-600 dark:text-gray-300">单 IP 取样</label>
-                        <select
-                            id="download-test-duration"
-                            value={downloadDuration}
-                            onChange={(e) => setDownloadDuration(e.target.value)}
-                            disabled={isDownloadTesting}
-                            className="p-1.5 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white disabled:opacity-60"
-                        >
-                            <option value="3000">3 秒</option>
-                            <option value="5000">5 秒</option>
-                            <option value="10000">10 秒</option>
-                        </select>
-                        {isDownloadTesting ? (
-                            <button
-                                type="button"
-                                onClick={handleStopDownloadTest}
-                                className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                    <div className="mb-3 space-y-2">
+                        <div className="flex flex-wrap items-center gap-3">
+                            <label htmlFor="download-test-duration" className="text-sm text-gray-600 dark:text-gray-300">单 IP 取样</label>
+                            <select
+                                id="download-test-duration"
+                                value={downloadDuration}
+                                onChange={(e) => setDownloadDuration(e.target.value)}
+                                disabled={isDownloadTesting || isLatencyTesting}
+                                className="p-1.5 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white disabled:opacity-60"
                             >
-                                <StopCircle className="w-4 h-4" />
-                                停止测速
-                            </button>
-                        ) : (
-                            <button
-                                type="button"
-                                onClick={handleDownloadSpeedTest}
-                                disabled={regionLimitedResults.length === 0}
-                                className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
-                            >
-                                <Gauge className="w-4 h-4" />
-                                下载测速 ({regionLimitedResults.length})
-                            </button>
-                        )}
-                        {isDownloadTesting && (
-                            <span className="text-sm text-gray-600 dark:text-gray-300" role="status">
-                                {downloadProgress.completed}/{downloadProgress.total}
-                                {downloadProgress.currentIp ? ` · ${downloadProgress.currentIp}` : ''}
-                            </span>
-                        )}
-                        {!isDownloadTesting && downloadTestMessage && (
-                            <span className="text-sm text-gray-600 dark:text-gray-300" role="status">{downloadTestMessage}</span>
+                                <option value="3000">3 秒</option>
+                                <option value="5000">5 秒</option>
+                                <option value="10000">10 秒</option>
+                            </select>
+                            {isDownloadTesting ? (
+                                <button
+                                    type="button"
+                                    onClick={handleStopDownloadTest}
+                                    className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                                >
+                                    <StopCircle className="w-4 h-4" />
+                                    停止测速
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={handleDownloadSpeedTest}
+                                    disabled={isLatencyTesting || regionLimitedResults.length === 0}
+                                    className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                                >
+                                    <Gauge className="w-4 h-4" />
+                                    下载测速 ({regionLimitedResults.length})
+                                </button>
+                            )}
+                            {isLatencyTesting ? (
+                                <button
+                                    type="button"
+                                    onClick={handleStopLatencyTest}
+                                    className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                                >
+                                    <StopCircle className="w-4 h-4" />
+                                    停止测延迟
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={handleLatencyTest}
+                                    disabled={isDownloadTesting || isSaving || latencyTestTargets.length === 0}
+                                    className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-teal-600 rounded hover:bg-teal-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                                >
+                                    <RefreshCw className="w-4 h-4" />
+                                    重测延迟 ({latencyTestTargets.length})
+                                </button>
+                            )}
+                        </div>
+                        {(isDownloadTesting || downloadTestMessage || isLatencyTesting || latencyTestMessage) && (
+                            <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-gray-600 dark:text-gray-300" aria-live="polite">
+                                {(isDownloadTesting || downloadTestMessage) && (
+                                    <span role="status">
+                                        {isDownloadTesting
+                                            ? `下载测速 ${downloadProgress.completed}/${downloadProgress.total}${downloadProgress.currentIp ? ` · ${downloadProgress.currentIp}` : ''}`
+                                            : downloadTestMessage}
+                                    </span>
+                                )}
+                                {(isLatencyTesting || latencyTestMessage) && (
+                                    <span role="status">
+                                        {isLatencyTesting
+                                            ? `延迟复测 ${latencyProgress.completed}/${latencyProgress.total}${latencyProgress.currentIp ? ` · ${latencyProgress.currentIp}` : ''}`
+                                            : latencyTestMessage}
+                                    </span>
+                                )}
+                            </div>
                         )}
                     </div>
                     <div className="max-h-96 overflow-y-auto">
@@ -543,6 +692,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                             {limitedResults.map(({ ip, port, latency, colo, domain, downloadSpeedMBps, downloadSpeedError }) => {
                                 const measurement = downloadMeasurements[getResultKey({ ip, port })];
+                                const latencyMeasurement = latencyMeasurements[getResultKey({ ip, port })];
                                 const measuredSpeed = measurement?.status === 'done'
                                     ? measurement.speed
                                     : measurement?.status === 'error'
@@ -573,7 +723,15 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                         {domain && <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">域名</span>}
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{port}</td>
-                                    <td className={`px-6 py-4 whitespace-nowrap text-sm font-bold ${getLatencyColor(latency)}`}>{latency > -1 ? `${latency}ms` : 'N/A'}</td>
+                                    <td className={`px-6 py-4 whitespace-nowrap text-sm font-bold ${getLatencyColor(latency)}`}>
+                                        {latencyMeasurement?.status === 'testing'
+                                            ? '复测中...'
+                                            : latencyMeasurement?.status === 'pending'
+                                                ? '待复测'
+                                                : latency > -1
+                                                    ? `${latency}ms`
+                                                    : <span title={latencyMeasurement?.error || '延迟测试失败'}>N/A</span>}
+                                    </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-700 dark:text-gray-200">
                                         {measurement?.status === 'testing' ? '测速中...' :
                                                     measurement?.status === 'error' ? <span title={measurement.error}>测速失败</span> :
@@ -660,7 +818,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
 
                         <button
                             onClick={handleSave}
-                            disabled={isSaving || isDownloadTesting || selectedVisibleResults.length === 0 || !sceneName.trim()}
+                            disabled={isSaving || isDownloadTesting || isLatencyTesting || selectedVisibleResults.length === 0 || !sceneName.trim()}
                             className="flex items-center bg-blue-600 text-white font-bold py-2 px-6 rounded-md hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
                         >
                             <Save className="w-4 h-4 mr-2" />
