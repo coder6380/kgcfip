@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { getScenes, getSceneResults, saveResults } from '../api';
-import { getLatencyColor, ScanResult } from '../utils/scanner';
+import { BROWSER_LATENCY_TIMEOUT_MS, getLatencyColor, measureIpDownloadSpeed, measureIpLatency, ScanResult } from '../utils/scanner';
 import { getColoName } from '../utils/colo';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog'; // Import Trash2 and RotateCw
-import { ListChecks, Trash2, RotateCw, FileText, File, Copy } from 'lucide-react';
+import { Gauge, ListChecks, Trash2, RotateCw, FileText, File, Copy, StopCircle } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
 
 // Type for data stored in KV, which does not include `isAvailable`
@@ -14,16 +14,46 @@ interface SavedIpData {
     latency: number;
     colo?: string;
     domain?: boolean; // 是否为域名源
+    error?: string;
+    downloadSpeedMBps?: number | null;
+    downloadSpeedError?: string | null;
 }
 interface FlatIpItem extends SavedIpData {
     sceneName: string;
 }
+
+type SavedMeasurement = {
+    status: 'pending' | 'testing' | 'done' | 'error';
+    speed?: number;
+    error?: string;
+};
+
+type SavedLatencyMeasurement = {
+    status: 'pending' | 'testing' | 'done';
+    latency?: number;
+    colo?: string;
+    error?: string;
+};
+
+const getSavedResultKey = (item: Pick<FlatIpItem, 'ip' | 'port' | 'sceneName'>) =>
+    `${item.ip}:${item.port}#${item.sceneName}`;
 
 export function SavedIpList() {
     const [items, setItems] = useState<FlatIpItem[]>([]);
     const [loading, setLoading] = useState(false);
     const [selectedScenes, setSelectedScenes] = useState<Set<string>>(new Set());
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+    const [downloadDuration, setDownloadDuration] = useState('3000');
+    const [isDownloadTesting, setIsDownloadTesting] = useState(false);
+    const [downloadProgress, setDownloadProgress] = useState({ completed: 0, total: 0, currentIp: '' });
+    const [downloadTestMessage, setDownloadTestMessage] = useState('');
+    const [downloadMeasurements, setDownloadMeasurements] = useState<Record<string, SavedMeasurement>>({});
+    const [isLatencyTesting, setIsLatencyTesting] = useState(false);
+    const [latencyProgress, setLatencyProgress] = useState({ completed: 0, total: 0, currentIp: '' });
+    const [latencyTestMessage, setLatencyTestMessage] = useState('');
+    const [latencyMeasurements, setLatencyMeasurements] = useState<Record<string, SavedLatencyMeasurement>>({});
+    const downloadControllerRef = useRef<AbortController | null>(null);
+    const latencyControllerRef = useRef<AbortController | null>(null);
     const { showToast } = useToast();
     const { confirm } = useConfirm();
 
@@ -61,11 +91,277 @@ export function SavedIpList() {
         loadData();
     }, []);
 
+    useEffect(() => () => {
+        downloadControllerRef.current?.abort();
+        latencyControllerRef.current?.abort();
+    }, []);
+
     const uniqueScenes = Array.from(new Set(items.map(i => i.sceneName))).sort();
     const filteredItems = items.filter(i => selectedScenes.has(i.sceneName));
     const filteredItemsSorted = [...filteredItems].sort((a, b) => {
         return a.latency - b.latency;
     });
+    const isAnyTesting = isDownloadTesting || isLatencyTesting;
+
+    const handleDownloadSpeedTest = async () => {
+        if (isAnyTesting) return;
+        const targets = [...filteredItemsSorted];
+        if (targets.length === 0) {
+            showToast('当前场景筛选没有可测速的 IP', 'warning');
+            return;
+        }
+
+        const controller = new AbortController();
+        downloadControllerRef.current = controller;
+        setIsDownloadTesting(true);
+        setDownloadTestMessage('');
+        setDownloadProgress({ completed: 0, total: targets.length, currentIp: '' });
+        setDownloadMeasurements(previous => {
+            const next = { ...previous };
+            targets.forEach(item => { next[getSavedResultKey(item)] = { status: 'pending' }; });
+            return next;
+        });
+
+        const completedMeasurements = new Map<string, SavedMeasurement>();
+        let completed = 0;
+        try {
+            for (const item of targets) {
+                if (controller.signal.aborted) break;
+                const key = getSavedResultKey(item);
+                setDownloadProgress({ completed, total: targets.length, currentIp: item.ip });
+                setDownloadMeasurements(previous => ({ ...previous, [key]: { status: 'testing' } }));
+
+                try {
+                    const speed = await measureIpDownloadSpeed(
+                        item.ip,
+                        item.port,
+                        Number(downloadDuration),
+                        controller.signal,
+                    );
+                    const measurement: SavedMeasurement = { status: 'done', speed };
+                    completedMeasurements.set(key, measurement);
+                    setDownloadMeasurements(previous => ({ ...previous, [key]: measurement }));
+                } catch (error) {
+                    if (controller.signal.aborted) {
+                        setDownloadMeasurements(previous => ({ ...previous, [key]: { status: 'pending' } }));
+                        break;
+                    }
+                    const measurement: SavedMeasurement = {
+                        status: 'error',
+                        error: error instanceof Error ? error.message : '测速失败',
+                    };
+                    completedMeasurements.set(key, measurement);
+                    setDownloadMeasurements(previous => ({ ...previous, [key]: measurement }));
+                }
+
+                completed++;
+                setDownloadProgress({ completed, total: targets.length, currentIp: '' });
+            }
+
+            if (controller.signal.aborted) {
+                setDownloadMeasurements(previous => {
+                    const next = { ...previous };
+                    targets.forEach(item => {
+                        const key = getSavedResultKey(item);
+                        if (next[key]?.status === 'pending') delete next[key];
+                    });
+                    return next;
+                });
+            }
+
+            const scenesToUpdate = new Set(
+                targets.filter(item => completedMeasurements.has(getSavedResultKey(item))).map(item => item.sceneName),
+            );
+            let updatedItems = items;
+            let savedCount = 0;
+            let failedScenes = 0;
+
+            for (const scene of scenesToUpdate) {
+                const sceneResults = items.filter(item => item.sceneName === scene).map(item => {
+                    const { sceneName, ...result } = item;
+                    const measurement = completedMeasurements.get(getSavedResultKey(item));
+                    if (!measurement) return result;
+                    if (measurement.status === 'done') {
+                        return {
+                            ...result,
+                            downloadSpeedMBps: measurement.speed,
+                            downloadSpeedError: null,
+                        };
+                    }
+                    return {
+                        ...result,
+                        downloadSpeedMBps: null,
+                        downloadSpeedError: measurement.error || '测速失败',
+                    };
+                });
+
+                try {
+                    await saveResults(scene, sceneResults as ScanResult[], 'overwrite');
+                    const sceneUpdates = new Map(sceneResults.map(result => [`${result.ip}:${result.port}`, result]));
+                    updatedItems = updatedItems.map(item => {
+                        if (item.sceneName !== scene) return item;
+                        const result = sceneUpdates.get(`${item.ip}:${item.port}`);
+                        return result ? { ...result, sceneName: scene } : item;
+                    });
+                    savedCount += items.filter(item =>
+                        item.sceneName === scene && completedMeasurements.has(getSavedResultKey(item)),
+                    ).length;
+                } catch (error) {
+                    failedScenes++;
+                    console.error(`Failed to save download measurements for scene ${scene}`, error);
+                }
+            }
+
+            if (scenesToUpdate.size > 0) setItems(updatedItems);
+            setDownloadProgress({ completed, total: targets.length, currentIp: '' });
+            const stoppedMessage = controller.signal.aborted ? `已停止，完成 ${completed}/${targets.length}` : '';
+            if (failedScenes > 0) {
+                setDownloadTestMessage(`${stoppedMessage ? `${stoppedMessage}；` : ''}有 ${failedScenes} 个场景保存失败`);
+                showToast(`测速完成，部分场景未能保存`, 'error');
+            } else if (savedCount > 0) {
+                setDownloadTestMessage(stoppedMessage || `测速完成，已保存 ${savedCount} 个结果`);
+                showToast(`下载测速完成，已保存 ${savedCount} 个结果`, 'success');
+            } else {
+                setDownloadTestMessage(stoppedMessage || '测速未产生可保存结果');
+            }
+        } finally {
+            downloadControllerRef.current = null;
+            setIsDownloadTesting(false);
+        }
+    };
+
+    const handleLatencyTest = async () => {
+        if (isAnyTesting) return;
+        const targets = [...filteredItemsSorted];
+        if (targets.length === 0) {
+            showToast('当前场景筛选没有可测速的 IP', 'warning');
+            return;
+        }
+
+        const controller = new AbortController();
+        latencyControllerRef.current = controller;
+        setIsLatencyTesting(true);
+        setLatencyTestMessage('');
+        setLatencyProgress({ completed: 0, total: targets.length, currentIp: '' });
+        setLatencyMeasurements(previous => {
+            const next = { ...previous };
+            targets.forEach(item => { next[getSavedResultKey(item)] = { status: 'pending' }; });
+            return next;
+        });
+
+        const completedMeasurements = new Map<string, SavedLatencyMeasurement>();
+        let cursor = 0;
+        let completed = 0;
+
+        try {
+            const worker = async () => {
+                while (!controller.signal.aborted) {
+                    const item = targets[cursor++];
+                    if (!item) return;
+
+                    const key = getSavedResultKey(item);
+                    setLatencyProgress(previous => ({ ...previous, currentIp: item.ip }));
+                    setLatencyMeasurements(previous => ({ ...previous, [key]: { status: 'testing' } }));
+
+                    let result: SavedLatencyMeasurement;
+                    try {
+                        const measurement = await measureIpLatency(
+                            item.ip,
+                            item.port,
+                            BROWSER_LATENCY_TIMEOUT_MS,
+                            controller.signal,
+                        );
+                        if (controller.signal.aborted) return;
+                        result = { status: 'done', ...measurement };
+                    } catch (error) {
+                        if (controller.signal.aborted) return;
+                        result = {
+                            status: 'done',
+                            latency: -1,
+                            error: error instanceof Error ? error.message : '测速失败',
+                        };
+                    }
+
+                    completedMeasurements.set(key, result);
+                    setLatencyMeasurements(previous => ({ ...previous, [key]: result }));
+                    completed++;
+                    setLatencyProgress({ completed, total: targets.length, currentIp: '' });
+                }
+            };
+
+            await Promise.all(Array.from({ length: Math.min(8, targets.length) }, () => worker()));
+
+            if (controller.signal.aborted) {
+                setLatencyMeasurements(previous => {
+                    const next = { ...previous };
+                    targets.forEach(item => {
+                        const key = getSavedResultKey(item);
+                        if (next[key]?.status === 'pending' || next[key]?.status === 'testing') delete next[key];
+                    });
+                    return next;
+                });
+            }
+
+            const scenesToUpdate = new Set(
+                targets.filter(item => completedMeasurements.has(getSavedResultKey(item))).map(item => item.sceneName),
+            );
+            let updatedItems = items;
+            let savedCount = 0;
+            let failedScenes = 0;
+
+            for (const scene of scenesToUpdate) {
+                const sceneResults = items.filter(item => item.sceneName === scene).map(item => {
+                    const { sceneName, ...result } = item;
+                    const measurement = completedMeasurements.get(getSavedResultKey(item));
+                    if (!measurement) return result;
+                    const latency = measurement.latency ?? -1;
+                    return {
+                        ...result,
+                        latency,
+                        colo: latency > 0 && measurement.colo && measurement.colo !== '-'
+                            ? measurement.colo
+                            : result.colo,
+                        error: measurement.error || undefined,
+                    };
+                });
+
+                try {
+                    await saveResults(scene, sceneResults as ScanResult[], 'overwrite');
+                    const sceneUpdates = new Map(sceneResults.map(result => [`${result.ip}:${result.port}`, result]));
+                    updatedItems = updatedItems.map(item => {
+                        if (item.sceneName !== scene) return item;
+                        const result = sceneUpdates.get(`${item.ip}:${item.port}`);
+                        return result ? { ...result, sceneName: scene } : item;
+                    });
+                    savedCount += targets.filter(item =>
+                        item.sceneName === scene && completedMeasurements.has(getSavedResultKey(item)),
+                    ).length;
+                } catch (error) {
+                    failedScenes++;
+                    console.error(`Failed to save latency measurements for scene ${scene}`, error);
+                }
+            }
+
+            if (scenesToUpdate.size > 0) setItems(updatedItems);
+            setLatencyProgress({ completed, total: targets.length, currentIp: '' });
+            const stoppedMessage = controller.signal.aborted ? `已停止，完成 ${completed}/${targets.length}` : '';
+            if (failedScenes > 0) {
+                setLatencyTestMessage(`${stoppedMessage ? `${stoppedMessage}；` : ''}有 ${failedScenes} 个场景保存失败`);
+                showToast('延迟测试完成，部分场景保存失败', 'error');
+            } else if (savedCount > 0) {
+                setLatencyTestMessage(stoppedMessage || `延迟测试完成，已更新 ${savedCount} 条`);
+                showToast(`延迟测试完成，已更新 ${savedCount} 条`, 'success');
+            } else {
+                setLatencyTestMessage(stoppedMessage || '没有完成的延迟测试结果');
+            }
+        } finally {
+            latencyControllerRef.current = null;
+            setIsLatencyTesting(false);
+        }
+    };
+
+    const handleStopDownloadTest = () => downloadControllerRef.current?.abort();
+    const handleStopLatencyTest = () => latencyControllerRef.current?.abort();
 
     const handleCheckboxChange = (id: string, checked: boolean) => {
         const newSet = new Set(selectedItems);
@@ -85,7 +381,7 @@ export function SavedIpList() {
     };
 
     const handleDeleteSelected = async () => {
-        if (selectedItems.size === 0) return;
+        if (selectedItems.size === 0 || isAnyTesting) return;
         const isConfirmed = await confirm(`确定要删除选中的 ${selectedItems.size} 个IP/域名吗？`, {
             confirmText: '确定删除',
         });
@@ -121,13 +417,15 @@ export function SavedIpList() {
             return;
         }
 
-        const headers = ['IP地址', '端口', '延迟(ms)', '地区代码', '地区名称', '场景'];
+        const headers = ['IP地址', '端口', '延迟(ms)', '下载速度(MB/s)', '测速失败原因', '地区代码', '地区名称', '场景'];
         const csvContent = [
             headers.join(','),
             ...filteredItemsSorted.map(item => [
                 item.ip,
                 item.port,
                 item.latency,
+                typeof item.downloadSpeedMBps === 'number' ? item.downloadSpeedMBps.toFixed(2) : '',
+                item.downloadSpeedError || '',
                 item.colo || '',
                 getColoName(item.colo || ''),
                 item.sceneName,
@@ -223,7 +521,8 @@ export function SavedIpList() {
                         {selectedItems.size > 0 && (
                             <button
                                 onClick={handleDeleteSelected}
-                                className="px-4 py-1.5 text-sm font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
+                                disabled={isAnyTesting}
+                                className="px-4 py-1.5 text-sm font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 <Trash2 className="w-4 h-4 mr-1 inline-block" />
                                 删除选中 ({selectedItems.size})
@@ -231,7 +530,8 @@ export function SavedIpList() {
                         )}
                         <button
                             onClick={loadData}
-                            className="px-4 py-1.5 text-sm font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
+                            disabled={loading || isAnyTesting}
+                            className="px-4 py-1.5 text-sm font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             <RotateCw className="w-4 h-4 mr-1 inline-block" />
                             刷新
@@ -254,6 +554,7 @@ export function SavedIpList() {
                                         else newSet.add(scene);
                                         setSelectedScenes(newSet);
                                     }}
+                                    disabled={isAnyTesting}
                                     className={`px-2.5 py-1 text-xs font-medium rounded-full border transition-colors ${
                                         isSelected
                                             ? 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100 dark:bg-indigo-900/40 dark:text-indigo-200 dark:border-indigo-700/60 dark:hover:bg-indigo-800/60'
@@ -269,6 +570,7 @@ export function SavedIpList() {
                             <button
                                 type="button"
                                 onClick={() => setSelectedScenes(new Set(uniqueScenes))}
+                                disabled={isAnyTesting}
                                 className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
                             >
                                 全选
@@ -276,12 +578,86 @@ export function SavedIpList() {
                             <button
                                 type="button"
                                 onClick={() => setSelectedScenes(new Set())}
+                                disabled={isAnyTesting}
                                 className="px-3 py-1 text-xs font-medium text-gray-800 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors"
                             >
                                 清空
                             </button>
                         </div>
                 </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 mb-4">
+                <label htmlFor="saved-download-duration" className="text-sm text-gray-600 dark:text-gray-300">单 IP 取样</label>
+                <select
+                    id="saved-download-duration"
+                    value={downloadDuration}
+                    onChange={(e) => setDownloadDuration(e.target.value)}
+                    disabled={isAnyTesting}
+                    className="p-1.5 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white disabled:opacity-60"
+                >
+                    <option value="3000">3 秒</option>
+                    <option value="5000">5 秒</option>
+                    <option value="10000">10 秒</option>
+                </select>
+                {isDownloadTesting ? (
+                    <button
+                        type="button"
+                        onClick={handleStopDownloadTest}
+                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                    >
+                        <StopCircle className="w-4 h-4" />
+                        停止测速
+                    </button>
+                ) : (
+                    <button
+                        type="button"
+                        onClick={handleDownloadSpeedTest}
+                        disabled={loading || isLatencyTesting || filteredItemsSorted.length === 0}
+                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                    >
+                        <Gauge className="w-4 h-4" />
+                        测下载速度 ({filteredItemsSorted.length})
+                    </button>
+                )}
+                {isDownloadTesting && (
+                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">
+                        {downloadProgress.completed}/{downloadProgress.total}
+                        {downloadProgress.currentIp ? ` · ${downloadProgress.currentIp}` : ''}
+                    </span>
+                )}
+                {!isDownloadTesting && downloadTestMessage && (
+                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">{downloadTestMessage}</span>
+                )}
+                {isLatencyTesting ? (
+                    <button
+                        type="button"
+                        onClick={handleStopLatencyTest}
+                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                    >
+                        <StopCircle className="w-4 h-4" />
+                        停止延迟测试
+                    </button>
+                ) : (
+                    <button
+                        type="button"
+                        onClick={handleLatencyTest}
+                        disabled={loading || isDownloadTesting || filteredItemsSorted.length === 0}
+                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-teal-600 rounded hover:bg-teal-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                    >
+                        <Gauge className="w-4 h-4" />
+                        测延迟 ({filteredItemsSorted.length})
+                    </button>
+                )}
+                {isLatencyTesting && (
+                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">
+                        {latencyProgress.completed}/{latencyProgress.total}
+                        {latencyProgress.currentIp ? ` · ${latencyProgress.currentIp}` : ''}
+                    </span>
+                )}
+                {!isLatencyTesting && latencyTestMessage && (
+                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">{latencyTestMessage}</span>
+                )}
             </div>
 
             <div className="overflow-auto" style={{ maxHeight: '600px' }}>
@@ -299,6 +675,7 @@ export function SavedIpList() {
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">IP/域名</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">端口</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">延迟</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">下载速度 (MB/s)</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区代码</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">场景</th>
@@ -306,9 +683,9 @@ export function SavedIpList() {
                     </thead>
                     <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                         {loading ? (
-                            <tr><td colSpan={7} className="px-4 py-4 text-center text-gray-500">加载中...</td></tr>
+                            <tr><td colSpan={8} className="px-4 py-4 text-center text-gray-500">加载中...</td></tr>
                         ) : filteredItems.length === 0 ? (
-                            <tr><td colSpan={7} className="px-4 py-4 text-center text-gray-500">暂无数据</td></tr>
+                            <tr><td colSpan={8} className="px-4 py-4 text-center text-gray-500">暂无数据</td></tr>
                         ) : (
                             filteredItemsSorted.map((item) => (
                                 <tr key={`${item.ip}-${item.port}-${item.sceneName}`} className="hover:bg-gray-50 dark:hover:bg-gray-700">
@@ -325,8 +702,31 @@ export function SavedIpList() {
                                         {item.domain && <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">域名</span>}
                                     </td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.port}</td>
-                                    <td className={`px-4 py-2 whitespace-nowrap text-sm font-semibold ${getLatencyColor(item.latency)}`}>
-                                        {item.latency > -1 ? `${item.latency}ms` : 'N/A'}
+                                    <td className={`px-4 py-2 whitespace-nowrap text-sm font-semibold ${getLatencyColor(latencyMeasurements[getSavedResultKey(item)]?.latency ?? item.latency)}`}>
+                                        {(() => {
+                                            const measurement = latencyMeasurements[getSavedResultKey(item)];
+                                            if (measurement?.status === 'testing') return '测速中...';
+                                            if (measurement?.status === 'pending') return '待测速';
+                                            const latency = measurement?.latency ?? item.latency;
+                                            if (latency > -1) return `${latency}ms`;
+                                            const error = measurement?.error || item.error;
+                                            return error ? <span title={error}>失败</span> : 'N/A';
+                                        })()}
+                                    </td>
+                                    <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-700 dark:text-gray-200">
+                                        {(() => {
+                                            const measurement = downloadMeasurements[getSavedResultKey(item)];
+                                            if (measurement?.status === 'testing') return '测速中...';
+                                            if (measurement?.status === 'pending') return '待测速';
+                                            if (measurement?.status === 'error') {
+                                                return <span title={measurement.error}>测速失败</span>;
+                                            }
+                                            if (typeof measurement?.speed === 'number') return `${measurement.speed.toFixed(2)} MB/s`;
+                                            if (item.downloadSpeedError) return <span title={item.downloadSpeedError}>测速失败</span>;
+                                            return typeof item.downloadSpeedMBps === 'number'
+                                                ? `${item.downloadSpeedMBps.toFixed(2)} MB/s`
+                                                : '-';
+                                        })()}
                                     </td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo || '-'}</td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo ? <RegionDisplay colo={item.colo} flagSize="sm" /> : '-'}</td>

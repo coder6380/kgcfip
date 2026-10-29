@@ -15,6 +15,8 @@ export interface ScanResult {
     tcpMs?: number;        // TCP 三次握手耗时
     tlsMs?: number;        // 累计到 TLS 握手完成的耗时
     error?: string;        // 不可用时的原因
+    downloadSpeedMBps?: number | null; // 浏览器下载速度 (MB/s)
+    downloadSpeedError?: string | null; // 浏览器下载测速失败原因
 }
 
 /**
@@ -33,9 +35,9 @@ export function isDomainName(host: string): boolean {
  * 通过阿里云公共 DNS (DoH) 将域名解析为 IP（优先 A 记录，其次 AAAA）
  * 使用 dns.alidns.com，在大陆网络环境下可正常访问
  */
-export async function resolveDomainToIp(host: string): Promise<string | null> {
+export async function resolveDomainToIp(host: string, signal?: AbortSignal): Promise<string | null> {
     const query = (type: 'A' | 'AAAA') =>
-        fetch(`https://dns.alidns.com/resolve?name=${encodeURIComponent(host)}&type=${type}`);
+        fetch(`https://dns.alidns.com/resolve?name=${encodeURIComponent(host)}&type=${type}`, { signal });
 
     try {
         const resA = await query('A');
@@ -89,71 +91,173 @@ function isIPv6(ip: string): boolean {
 }
 
 /**
- * 测试单个 IP 的延迟并获取其 Cloudflare colo
- *
- * 浏览器无法直接为任意 IP 设置自定义 TLS SNI，故采用「hex 域名技巧」：
- * 将 IPv4 编码进子域名 <hexIp>.ns.psb.kdns.fr，由 Cloudflare 边缘按
- * ip.json 端点返回 colo；IPv6 则直接连地址并指定 Host 头。
- * 该路径依赖浏览器对测速域名的 DNS 解析，解析不通即自然返回失败，
- * 从而引导用户改用更可靠的「本地 Agent 测速」。
+ * 在浏览器中通过 Cloudflare 下载端点测量单个 IPv4 的实际下载速度。
+ * 只统计响应流收到的字节；达到取样时长后中止请求。
  */
-async function testIpLatency(ip: string, port: number, timeout: number): Promise<Omit<ScanResult, 'isAvailable' | 'ip' | 'port'>> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-    const headers: Record<string, string> = { 'User-Agent': 'Cloudflare-IP-Scanner/1.0' };
-    let testUrl: string;
-    if (isIPv6(ip)) {
-        // IPv6 无法使用 hex 技巧，直接连接地址并指定 Host 头部，
-        // 由 Cloudflare 边缘按 ip.json 特殊端点返回 colo
-        headers['Host'] = 'ns.psb.kdns.fr';
-        testUrl = `https://[${ip}]:${port}/ip.json?_t=${Date.now()}`;
-    } else {
-        // IPv4 通过 IP 转换得到的十六进制拼接测速域名，返回的 JSON 中 "colo" 字段即为机场码
-        const hexIp = ipToHex(ip);
-        const testDomain = hexIp ? `${hexIp}.ns.psb.kdns.fr` : `${ip}.ns.psb.kdns.fr`;
-        testUrl = `https://${testDomain}:${port}/ip.json?_t=${Date.now()}`;
+export async function measureIpDownloadSpeed(
+    ip: string,
+    port: number,
+    sampleDurationMs: number,
+    signal?: AbortSignal,
+): Promise<number> {
+    let testIp = ip;
+    if (isDomainName(testIp)) {
+        const resolved = await resolveDomainToIp(testIp);
+        if (!resolved) throw new Error('域名解析失败');
+        testIp = resolved;
     }
 
-    try {
-        // 第一次请求用于预热 DNS、TLS 等，并获取 colo
-        const response1 = await fetch(testUrl, {
-            signal: controller.signal,
-            headers,
-        });
+    if (isIPv6(testIp)) throw new Error('IPv6 暂不支持下载测速');
 
-        if (!response1.ok) {
-            return { latency: -1, colo: `HTTP ${response1.status}` };
+    const hexIp = ipToHex(testIp);
+    if (!hexIp) throw new Error('无效的 IPv4 地址');
+    if (!Number.isFinite(sampleDurationMs) || sampleDurationMs <= 0) {
+        throw new Error('测速时长无效');
+    }
+    if (signal?.aborted) throw new DOMException('测速已停止', 'AbortError');
+
+    const controller = new AbortController();
+    const abortFromCaller = () => controller.abort();
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+
+    let requestTimedOut = false;
+    let sampleEndedAt: number | null = null;
+    let sampleStartAt: number | null = null;
+    let sampleTimer: ReturnType<typeof setTimeout> | undefined;
+    const requestTimer = setTimeout(() => {
+        requestTimedOut = true;
+        controller.abort();
+    }, 15000);
+
+    let receivedBytes = 0;
+    const url = `https://${hexIp}.ns.psb.kdns.fr:${port}/__down?bytes=100000000&_t=${Date.now()}`;
+
+    try {
+        const response = await fetch(url, {
+            signal: controller.signal,
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.body) throw new Error('浏览器无法读取下载数据');
+
+        const reader = response.body.getReader();
+        try {
+            while (true) {
+                let chunk: ReadableStreamReadResult<Uint8Array>;
+                try {
+                    chunk = await reader.read();
+                } catch (error) {
+                    if (sampleEndedAt !== null && !signal?.aborted) break;
+                    throw error;
+                }
+
+                if (chunk.done) break;
+                if (!chunk.value.byteLength) continue;
+
+                if (sampleStartAt === null) {
+                    sampleStartAt = performance.now();
+                    sampleTimer = setTimeout(() => {
+                        sampleEndedAt = performance.now();
+                        controller.abort();
+                    }, sampleDurationMs);
+                }
+                receivedBytes += chunk.value.byteLength;
+            }
+        } finally {
+            reader.releaseLock();
+        }
+    } catch (error) {
+        if (requestTimedOut) throw new Error('连接超时');
+        throw error;
+    } finally {
+        clearTimeout(requestTimer);
+        if (sampleTimer) clearTimeout(sampleTimer);
+        signal?.removeEventListener('abort', abortFromCaller);
+    }
+
+    if (signal?.aborted) throw new DOMException('测速已停止', 'AbortError');
+    if (receivedBytes === 0 || sampleStartAt === null) throw new Error('未收到下载数据');
+
+    const endedAt = sampleEndedAt ?? performance.now();
+    const elapsedSeconds = (endedAt - sampleStartAt) / 1000;
+    if (elapsedSeconds <= 0) throw new Error('测速时间过短');
+    return receivedBytes / 1_000_000 / elapsedSeconds;
+}
+
+/** Browser request timeout, independent of the latency acceptance limit. */
+export const BROWSER_LATENCY_TIMEOUT_MS = 5000;
+
+export interface IpLatencyMeasurement {
+    latency: number;
+    colo: string;
+    error?: string;
+}
+
+/** Measure one HTTPS request to the target and stop timing when response headers arrive. */
+export async function measureIpLatency(
+    ip: string,
+    port: number,
+    timeout = BROWSER_LATENCY_TIMEOUT_MS,
+    signal?: AbortSignal,
+): Promise<IpLatencyMeasurement> {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, timeout);
+    const abortFromCaller = () => controller.abort();
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+    if (signal?.aborted) controller.abort();
+
+    try {
+        let testIp = ip;
+        if (isDomainName(testIp)) {
+            const resolved = await resolveDomainToIp(testIp, controller.signal);
+            if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
+            if (!resolved) throw new Error('域名解析失败');
+            testIp = resolved;
+        }
+
+        if (isIPv6(testIp)) throw new Error('浏览器模式暂不支持 IPv6');
+
+        const hexIp = ipToHex(testIp);
+        if (!hexIp) throw new Error('无效的 IPv4 地址');
+
+        const testUrl = `https://${hexIp}.ns.psb.kdns.fr:${port}/ip.json?_t=${Date.now()}`;
+        const requestStart = performance.now();
+        const response = await fetch(testUrl, {
+            signal: controller.signal,
+            cache: 'no-store',
+        });
+        clearTimeout(timeoutId);
+        const latency = Math.max(1, Math.round(performance.now() - requestStart));
+
+        if (response.status !== 200) {
+            const error = `HTTP ${response.status}`;
+            return { latency: -1, colo: error, error };
         }
 
         let colo = '-';
+        const metadataTimeoutId = setTimeout(() => controller.abort(), 1000);
         try {
-            // 该测速地址的响应体包含 colo 信息 (例如 {"colo": "LAX", ...})
-            const data = await response1.json() as { colo?: string };
-            if (data?.colo) {
-                colo = data.colo;
-            }
-        } catch (e) {
-            // 如果响应不是 JSON，则忽略
+            const data = await response.json() as { colo?: string };
+            if (data?.colo) colo = data.colo;
+        } catch {
+            // The response time is already recorded; colo is optional metadata.
+        } finally {
+            clearTimeout(metadataTimeoutId);
         }
-
-        // 第二次请求用于获取更准确的 RTT
-        const secondRequestStart = Date.now();
-        await fetch(testUrl, {
-            signal: controller.signal,
-            headers,
-        });
-        const latency = Date.now() - secondRequestStart;
 
         return { latency, colo };
 
     } catch (error: any) {
-        if (error.name === 'AbortError') {
-            return { latency: -1, colo: 'Timeout' };
-        }
-        return { latency: -1, colo: 'Error' };
+        if (signal?.aborted) return { latency: -1, colo: 'Stopped', error: '测速已停止' };
+        const message = timedOut ? '连接超时' : error instanceof Error ? error.message : '测速失败';
+        return { latency: -1, colo: message, error: message };
     } finally {
         clearTimeout(timeoutId);
+        signal?.removeEventListener('abort', abortFromCaller);
     }
 }
 
@@ -161,7 +265,7 @@ async function testIpLatency(ip: string, port: number, timeout: number): Promise
  * 浏览器端测速可用性自检：探测测速域名能否被解析。
  * 注意该域名是通配符解析，裸域 ns.psb.kdns.fr 本身可能无记录，
  * 因此按实际测速路径，用十六进制编码的样例 IP 子域名去探测
- * （与 testIpLatency 拼接的 <hexIp>.ns.psb.kdns.fr 完全一致）。
+ * （与 measureIpLatency 拼接的 <hexIp>.ns.psb.kdns.fr 完全一致）。
  *
  * 为避免单次 DNS 偶发失败造成误判，默认随机取样例 IP 并行探测 10 次，
  * 只要有一次解析成功即认为当前环境可进行网页测速；
@@ -301,7 +405,7 @@ export class BatchScanner {
                     testHost = resolved;
                 }
 
-                const { latency, colo } = await testIpLatency(testHost, port, this.latencyLimit);
+                const { latency, colo, error } = await measureIpLatency(testHost, port);
 
                 const result: ScanResult = {
                     ip: isDomain ? host : testHost, // 域名源保存域名，IP源保存IP
@@ -309,6 +413,7 @@ export class BatchScanner {
                     isAvailable: latency > 0 && latency <= this.latencyLimit,
                     latency,
                     colo,
+                    error,
                     domain: isDomain || undefined,
                 };
 
@@ -357,18 +462,22 @@ function generateRandomIPFromCIDR(cidr: string): string {
 /**
  * 从 CIDR 列表生成指定数量的随机 IP
  */
-export function generateRandomIps(cidrs: string[], count: number): string[] {
-    if (!cidrs || cidrs.length === 0) {
+export function generateRandomIps(
+    cidrs: string[],
+    count: number,
+    excludedIps: ReadonlySet<string> = new Set(),
+): string[] {
+    if (!cidrs || cidrs.length === 0 || count <= 0) {
         return [];
     }
     const randomIps = new Set<string>();
-    const maxAttempts = count * 5; 
+    const maxAttempts = count * 10;
     let attempts = 0;
 
     while (randomIps.size < count && attempts < maxAttempts) {
         const randomCidr = cidrs[Math.floor(Math.random() * cidrs.length)];
         const randomIp = generateRandomIPFromCIDR(randomCidr);
-        randomIps.add(randomIp);
+        if (!excludedIps.has(randomIp)) randomIps.add(randomIp);
         attempts++;
     }
     return Array.from(randomIps);

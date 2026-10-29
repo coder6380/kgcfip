@@ -34,6 +34,7 @@ interface IpScannerConfigAndControlProps {
 }
 
 const PORTS_TO_TEST = [80, 443, 8080, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8443];
+const MAX_RANDOM_CANDIDATES_PER_RESULT = 20;
 
 export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndControlProps) {
     const [count, setCount] = useState<string>('500');
@@ -42,7 +43,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
 /*  */    const [countError, setCountError] = useState<string>('');
     const [threadsError, setThreadsError] = useState<string>('');
     const [latencyLimitError, setLatencyLimitError] = useState<string>('');
-    const [selectedPort, setSelectedPort] = useState(443);
+    const [selectedPort, setSelectedPort] = useState<number | 'random'>(443);
     const [ipSource, setIpSource] = useState<'cf' | 'cm' | 'third'>('cf');
     const [isScanning, setIsScanning] = useState(false);
     const [progress, setProgress] = useState(0);
@@ -65,6 +66,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
 
     const scannerRef = useRef<BatchScanner | null>(null);
     const cancelPreparingRef = useRef(false);
+    const scanStopRequestedRef = useRef(false);
     const { showToast } = useToast();
     const { confirm } = useConfirm();
 
@@ -145,7 +147,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         const threadsTrim = threads.trim();
         const latencyLimitTrim = latencyLimit.trim();
         let hasError = false;
-        if (ipSource !== 'third' && !/^\d+$/.test(countTrim)) {
+        if (ipSource !== 'third' && (!/^\d+$/.test(countTrim) || parseInt(countTrim, 10) < 1)) {
             setCountError('请输入有效的正整数');
             hasError = true;
         } else {
@@ -188,7 +190,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         return true;
     };
 
-    const prepareTargets = async (countNum: number): Promise<{ targets: string[]; resolvedMap?: Record<string, string | null> } | null> => {
+    const prepareTargets = async (
+        countNum: number,
+        excludedIps: ReadonlySet<string> = new Set(),
+    ): Promise<{ targets: string[]; resolvedMap?: Record<string, string | null> } | null> => {
         setSourceRows([]);
         setUniqueIpCount(0);
         setGrossIpCount(0);
@@ -299,7 +304,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             showToast('未找到Cloudflare IP段数据，请先点击上方的"同步IP段"按钮进行同步。', 'error');
             return null;
         }
-        return { targets: generateRandomIps(cidrsToUse, countNum) };
+        return { targets: generateRandomIps(cidrsToUse, countNum, excludedIps) };
     };
 
     // ---------- 本地 Agent 测速 ----------
@@ -349,8 +354,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         threadsNum: number,
         latencyLimitNum: number,
         onProgress: (r: ScanResult) => void,
-        onComplete: (rs: ScanResult[]) => void,
-    ) => {
+    ): Promise<ScanResult[]> => {
         if (!agentProbe?.online) throw new Error('本地 Agent 未连接');
         const base = agentProbe.baseUrl;
 
@@ -388,111 +392,165 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             await new Promise((r) => setTimeout(r, 400));
         }
 
-        onComplete(acc.filter((r) => r.isAvailable).sort((a, b) => a.latency - b.latency));
+        return acc.filter((r) => r.isAvailable).sort((a, b) => a.latency - b.latency);
     };
 
     const handleScan = async () => {
         cancelPreparingRef.current = false;
+        scanStopRequestedRef.current = false;
+        agentStopRef.current = false;
 
+        const resultsFound: ScanResult[] = [];
+        let scanStarted = false;
         const val = validateInputs();
         if (!val) return;
 
         setIsPreparing(true);
         try {
-            // Step 1: 地理定位检测
             const shouldContinue = await checkGeoLocation();
             if (!shouldContinue || cancelPreparingRef.current) {
                 setIsPreparing(false);
                 return;
             }
 
-            // Step 2: 准备靶标 IP
             const prepared = await prepareTargets(val.countNum);
             if (!prepared || prepared.targets.length === 0 || cancelPreparingRef.current) {
                 setIsPreparing(false);
                 return;
             }
-            const targets = prepared.targets;
 
-            // Step 3: 初始化扫描状态
+            const scanPort = ipSource === 'third' || selectedPort === 'random' ? 0 : selectedPort;
+            const targetAvailableCount = ipSource === 'third' ? null : val.countNum;
+            const maxRandomCandidates = targetAvailableCount === null
+                ? 0
+                : targetAvailableCount * MAX_RANDOM_CANDIDATES_PER_RESULT;
+            const attemptedIps = new Set<string>();
+            let candidates = prepared.targets;
+
             setProgress(0);
             setSuccessCount(0);
             setFailCount(0);
-            setTotal(targets.length);
-            await new Promise(resolve => setTimeout(resolve, 0));
-
-            const currentResults: ScanResult[] = [];
-            const onProgress = (result: ScanResult) => {
-                setProgress(p => p + 1);
-                currentResults.push(result);
-                if (result.isAvailable) {
-                    setSuccessCount(s => s + 1);
-                } else {
-                    setFailCount(f => f + 1);
-                }
-            };
-
-            const onComplete = (finalResults: ScanResult[]) => {
-                setIsStopping(false);
-                setIsPaused(false);
-                setAgentActive(false);
-                agentModeRef.current = false;
-                if (scannerRef.current) {
-                    scannerRef.current.stop();
-                }
-                setIsScanning(false);
-                setStartTime(null);
-                onScanComplete(finalResults);
-            };
-
-            // Step 4: 启动扫描（按当前 Tab 决定走本地 Agent 还是浏览器端）
+            setTotal(0);
             setIsPreparing(false);
             setIsScanning(true);
             setStartTime(Date.now());
             setNow(Date.now());
+            scanStarted = true;
 
             const agentReady = activeTab === 'local' && agentProbe?.online === true;
             agentModeRef.current = agentReady;
-            agentStopRef.current = false;
             setAgentActive(agentReady);
 
-            if (agentReady) {
-                const agentTargets = buildAgentTargets(
-                    targets,
-                    prepared.resolvedMap,
-                    ipSource === 'third' ? 0 : selectedPort,
-                );
-                await runAgentScan(agentTargets, val.threadsNum, val.latencyLimitNum, onProgress, onComplete);
-            } else {
-                const scanner = new BatchScanner(
-                    targets,
-                    ipSource === 'third' ? 0 : selectedPort,
-                    val.threadsNum,
-                    val.latencyLimitNum,
-                    onProgress,
-                    onComplete,
-                    prepared.resolvedMap,
-                );
-                scannerRef.current = scanner;
+            const onProgress = (result: ScanResult) => {
+                setProgress(progress => progress + 1);
+                if (result.isAvailable) setSuccessCount(success => success + 1);
+                else setFailCount(failures => failures + 1);
+            };
 
-                await scanner.run();
+            while (candidates.length > 0 && !scanStopRequestedRef.current) {
+                const remainingCount = targetAvailableCount === null
+                    ? candidates.length
+                    : targetAvailableCount - resultsFound.length;
+                const remainingCandidateBudget = maxRandomCandidates === null
+                    ? candidates.length
+                    : maxRandomCandidates - attemptedIps.size;
+                const batchLimit = Math.min(remainingCount, remainingCandidateBudget);
+                const batchCandidates = targetAvailableCount === null
+                    ? candidates
+                    : candidates.filter(ip => !attemptedIps.has(ip)).slice(0, batchLimit);
+
+                if (batchCandidates.length === 0) break;
+                if (targetAvailableCount !== null) batchCandidates.forEach(ip => attemptedIps.add(ip));
+
+                const scanTargets = selectedPort === 'random' && ipSource !== 'third'
+                    ? batchCandidates.map(target => {
+                        const randomPort = PORTS_TO_TEST[Math.floor(Math.random() * PORTS_TO_TEST.length)];
+                        return `${target}:${randomPort}`;
+                    })
+                    : batchCandidates;
+                setTotal(total => total + scanTargets.length);
+                await new Promise(resolve => setTimeout(resolve, 0));
+
+                let batchResults: ScanResult[] = [];
+                if (agentReady) {
+                    const agentTargets = buildAgentTargets(scanTargets, prepared.resolvedMap, scanPort);
+                    batchResults = await runAgentScan(agentTargets, val.threadsNum, val.latencyLimitNum, onProgress);
+                } else {
+                    const scanner = new BatchScanner(
+                        scanTargets,
+                        scanPort,
+                        val.threadsNum,
+                        val.latencyLimitNum,
+                        onProgress,
+                        results => { batchResults = results; },
+                        prepared.resolvedMap,
+                    );
+                    scannerRef.current = scanner;
+                    await scanner.run();
+                }
+
+                if (targetAvailableCount === null) {
+                    resultsFound.push(...batchResults);
+                    break;
+                }
+
+                const remainingSlots = targetAvailableCount - resultsFound.length;
+                resultsFound.push(...batchResults.slice(0, remainingSlots));
+                if (
+                    resultsFound.length >= targetAvailableCount ||
+                    scanStopRequestedRef.current ||
+                    attemptedIps.size >= maxRandomCandidates
+                ) break;
+
+                const nextBatchSize = Math.min(
+                    targetAvailableCount - resultsFound.length,
+                    maxRandomCandidates - attemptedIps.size,
+                );
+                const nextBatch = await prepareTargets(nextBatchSize, attemptedIps);
+                candidates = nextBatch?.targets ?? [];
+            }
+
+            const sortedResults = resultsFound.sort((a, b) => a.latency - b.latency);
+            setIsStopping(false);
+            setIsPaused(false);
+            setAgentActive(false);
+            agentModeRef.current = false;
+            scannerRef.current?.stop();
+            setIsScanning(false);
+            setStartTime(null);
+            onScanComplete(sortedResults);
+
+            if (targetAvailableCount !== null && resultsFound.length < targetAvailableCount) {
+                const reason = scanStopRequestedRef.current
+                    ? '已停止'
+                    : attemptedIps.size >= maxRandomCandidates
+                        ? `已达到候选上限 ${maxRandomCandidates}`
+                        : '未找到更多未测候选 IP';
+                showToast(`${reason}，找到 ${resultsFound.length}/${targetAvailableCount} 个符合延迟限制的 IP`, 'warning');
+            } else if (targetAvailableCount !== null) {
+                showToast(`已找到 ${targetAvailableCount} 个符合延迟限制的 IP`, 'success');
             }
         } catch (error) {
             console.error('Scan failed:', error);
             setIsScanning(false);
             setIsPreparing(false);
             setIsPaused(false);
+            setIsStopping(false);
+            setAgentActive(false);
+            agentModeRef.current = false;
+            scannerRef.current?.stop();
             setStartTime(null);
+            if (scanStarted) onScanComplete(resultsFound.sort((a, b) => a.latency - b.latency));
             showToast('启动测试失败，请检查控制台错误信息', 'error');
         }
     };
 
     const handleStopScan = () => {
+        scanStopRequestedRef.current = true;
         setIsStopping(true);
         setIsPaused(false);
         setStartTime(null);
         if (agentModeRef.current && agentProbe?.online) {
-            // 轮询循环会自行退出并触发 onComplete 收尾
             agentStopRef.current = true;
             void stopAgentScan(agentProbe.baseUrl);
         }
@@ -576,7 +634,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
                 <div>
-                    <label htmlFor="ip-count" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">随机IP数量:</label>
+                    <label htmlFor="ip-count" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">目标可用IP数量:</label>
                     <input
                         id="ip-count"
                         type="text"
@@ -589,7 +647,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 </div>
                 <div>
                     <label htmlFor="port-select" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">端口:</label>
-                    <select id="port-select" value={selectedPort} onChange={(e) => setSelectedPort(Number(e.target.value))} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing || ipSource === 'third'}>
+                    <select id="port-select" value={selectedPort} onChange={(e) => setSelectedPort(e.target.value === 'random' ? 'random' : Number(e.target.value))} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing || ipSource === 'third'}>
+                        <option value="random">随机（每 IP 一个）</option>
                         {PORTS_TO_TEST.map(port => (
                             <option key={port} value={port}>{port}</option>
                         ))}
@@ -857,7 +916,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             {isScanning && (() => {
                 const endRef = isPaused && pausedAt !== null ? pausedAt : now;
                 const elapsedSec = startTime ? Math.floor((endRef - startTime) / 1000) : 0;
-                const percent = total > 0 ? Math.round((progress / total) * 100) : 0;
+                const requestedCount = Math.max(1, parseInt(count, 10) || 1);
+                const percent = ipSource !== 'third'
+                    ? Math.min(100, Math.round((successCount / requestedCount) * 100))
+                    : total > 0 ? Math.round((progress / total) * 100) : 0;
                 const fmt = (s: number) => {
                     const m = Math.floor(s / 60);
                     const sec = s % 60;
@@ -871,7 +933,9 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                             </span>
                             <div className="flex items-center gap-2">
                                 <span className="text-sm font-medium text-purple-700 dark:text-white mr-1">
-                                    任务: {progress} / {total}
+                                    {ipSource !== 'third'
+                                        ? `已测 ${progress}/${total} · 合格 ${successCount}/${requestedCount}`
+                                        : `任务: ${progress} / ${total}`}
                                 </span>
                                 {isPaused ? (
                                     <button
@@ -916,8 +980,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                             </div>
                         </div>
                         <div className="w-full flex h-2.5 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
-                            <div className="bg-green-500 h-2.5 transition-all duration-300" style={{ width: `${total > 0 ? (successCount / total) * 100 : 0}%` }}></div>
-                            <div className="bg-red-500 h-2.5 transition-all duration-300" style={{ width: `${total > 0 ? (failCount / total) * 100 : 0}%` }}></div>
+                            <div className="bg-green-500 h-2.5 transition-all duration-300" style={{ width: `${ipSource !== 'third' ? percent : total > 0 ? (successCount / total) * 100 : 0}%` }}></div>
+                            {ipSource === 'third' && (
+                                <div className="bg-red-500 h-2.5 transition-all duration-300" style={{ width: `${total > 0 ? (failCount / total) * 100 : 0}%` }}></div>
+                            )}
                         </div>
                         <div className="flex justify-between text-sm mt-1">
                             <span className="text-green-600">成功: {successCount}</span>
