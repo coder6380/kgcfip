@@ -202,10 +202,6 @@ export async function measureIpLatency(
 ): Promise<IpLatencyMeasurement> {
     const controller = new AbortController();
     let timedOut = false;
-    const timeoutId = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-    }, timeout);
     const abortFromCaller = () => controller.abort();
     signal?.addEventListener('abort', abortFromCaller, { once: true });
     if (signal?.aborted) controller.abort();
@@ -213,8 +209,20 @@ export async function measureIpLatency(
     try {
         let testIp = ip;
         if (isDomainName(testIp)) {
-            const resolved = await resolveDomainToIp(testIp, controller.signal);
-            if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
+            const resolveTimeoutId = setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+            }, timeout);
+            let resolved: string | null;
+            try {
+                resolved = await resolveDomainToIp(testIp, controller.signal);
+            } finally {
+                clearTimeout(resolveTimeoutId);
+            }
+            if (controller.signal.aborted) {
+                if (signal?.aborted) throw new DOMException('测速已停止', 'AbortError');
+                throw new Error('连接超时');
+            }
             if (!resolved) throw new Error('域名解析失败');
             testIp = resolved;
         }
@@ -225,38 +233,76 @@ export async function measureIpLatency(
         if (!hexIp) throw new Error('无效的 IPv4 地址');
 
         const testUrl = `https://${hexIp}.ns.psb.kdns.fr:${port}/ip.json?_t=${Date.now()}`;
+        const fetchWithTimeout = async (method: 'OPTIONS' | 'GET', requestTimeout: number) => {
+            const requestController = new AbortController();
+            const abortRequest = () => requestController.abort();
+            controller.signal.addEventListener('abort', abortRequest, { once: true });
+            if (controller.signal.aborted) requestController.abort();
+            let requestTimedOut = false;
+            const requestTimeoutId = setTimeout(() => {
+                requestTimedOut = true;
+                timedOut = true;
+                requestController.abort();
+            }, requestTimeout);
+
+            try {
+                return await fetch(testUrl, {
+                    method,
+                    signal: requestController.signal,
+                    cache: 'no-store',
+                });
+            } catch (error) {
+                if (requestTimedOut) throw new Error('连接超时');
+                throw error;
+            } finally {
+                clearTimeout(requestTimeoutId);
+                controller.signal.removeEventListener('abort', abortRequest);
+            }
+        };
+
+        // Warm the same endpoint before timing the GET request.
+        let lastOptionsError: unknown;
+        let optionsSucceeded = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
+            try {
+                const optionsResponse = await fetchWithTimeout('OPTIONS', timeout * 2);
+                if (optionsResponse.ok) {
+                    optionsSucceeded = true;
+                    break;
+                }
+                lastOptionsError = new Error(`OPTIONS HTTP ${optionsResponse.status}`);
+            } catch (error) {
+                if (signal?.aborted) throw error;
+                lastOptionsError = error;
+            }
+        }
+        if (!optionsSucceeded) throw lastOptionsError || new Error('OPTIONS 不可用');
+
+        if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
         const requestStart = performance.now();
-        const response = await fetch(testUrl, {
-            signal: controller.signal,
-            cache: 'no-store',
-        });
-        clearTimeout(timeoutId);
-        const latency = Math.max(1, Math.round(performance.now() - requestStart));
+        const response = await fetchWithTimeout('GET', timeout);
 
         if (response.status !== 200) {
             const error = `HTTP ${response.status}`;
             return { latency: -1, colo: error, error };
         }
 
-        let colo = '-';
-        const metadataTimeoutId = setTimeout(() => controller.abort(), 1000);
+        let data: { colo?: string } = {};
         try {
-            const data = await response.json() as { colo?: string };
-            if (data?.colo) colo = data.colo;
+            data = await response.json() as { colo?: string };
         } catch {
-            // The response time is already recorded; colo is optional metadata.
-        } finally {
-            clearTimeout(metadataTimeoutId);
+            // The response body is small metadata; keep the measured HTTP response if it is malformed.
         }
+        const latency = Math.max(1, Math.round(performance.now() - requestStart));
 
-        return { latency, colo };
+        return { latency, colo: data?.colo || '-' };
 
     } catch (error: any) {
         if (signal?.aborted) return { latency: -1, colo: 'Stopped', error: '测速已停止' };
         const message = timedOut ? '连接超时' : error instanceof Error ? error.message : '测速失败';
         return { latency: -1, colo: message, error: message };
     } finally {
-        clearTimeout(timeoutId);
         signal?.removeEventListener('abort', abortFromCaller);
     }
 }
