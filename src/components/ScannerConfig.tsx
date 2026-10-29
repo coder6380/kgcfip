@@ -18,6 +18,7 @@ import {
     isDomainName,
     resolveDomainToIp,
     probeBrowserAvailable,
+    measureIpDownloadSpeed,
 } from '../utils/scanner';
 import {
     probeLocalAgent, startAgentScan, fetchAgentProgress, stopAgentScan,
@@ -35,15 +36,34 @@ interface IpScannerConfigAndControlProps {
 
 const PORTS_TO_TEST = [80, 443, 8080, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8443];
 const MAX_RANDOM_CANDIDATES_PER_RESULT = 20;
+const DOWNLOAD_SPEED_SAMPLE_DURATION_MS = 3000;
+
+const replaceTargetPort = (target: string, port: number) => {
+    const lastColonIndex = target.lastIndexOf(':');
+    const closeBracketIndex = target.lastIndexOf(']');
+    let host = target;
+
+    if (lastColonIndex > closeBracketIndex) {
+        const currentPort = Number.parseInt(target.substring(lastColonIndex + 1), 10);
+        if (!Number.isNaN(currentPort)) host = target.substring(0, lastColonIndex);
+    }
+
+    if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) {
+        host = `[${host}]`;
+    }
+    return `${host}:${port}`;
+};
 
 export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndControlProps) {
-    const [count, setCount] = useState<string>('500');
+    const [count, setCount] = useState<string>('50');
     const [threads, setThreads] = useState<string>('8');
-    const [latencyLimit, setLatencyLimit] = useState<string>('1000');
+    const [latencyLimit, setLatencyLimit] = useState<string>('500');
+    const [minimumDownloadSpeed, setMinimumDownloadSpeed] = useState<string>('10');
 /*  */    const [countError, setCountError] = useState<string>('');
     const [threadsError, setThreadsError] = useState<string>('');
     const [latencyLimitError, setLatencyLimitError] = useState<string>('');
-    const [selectedPort, setSelectedPort] = useState<number | 'random'>(443);
+    const [downloadSpeedError, setDownloadSpeedError] = useState<string>('');
+    const [selectedPort, setSelectedPort] = useState<number | 'random'>('random');
     const [ipSource, setIpSource] = useState<'cf' | 'cm' | 'third'>('cf');
     const [isScanning, setIsScanning] = useState(false);
     const [progress, setProgress] = useState(0);
@@ -63,8 +83,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     const [now, setNow] = useState(Date.now());
     const [isPaused, setIsPaused] = useState(false);
     const [pausedAt, setPausedAt] = useState<number | null>(null);
+    const [scanStage, setScanStage] = useState<'latency' | 'download'>('latency');
 
     const scannerRef = useRef<BatchScanner | null>(null);
+    const speedTestControllerRef = useRef<AbortController | null>(null);
     const cancelPreparingRef = useRef(false);
     const scanStopRequestedRef = useRef(false);
     const { showToast } = useToast();
@@ -142,12 +164,13 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         return result;
     };
 
-    const validateInputs = (): { countNum: number; threadsNum: number; latencyLimitNum: number } | null => {
+    const validateInputs = (): { countNum: number; threadsNum: number; latencyLimitNum: number; minimumDownloadSpeedNum: number } | null => {
         const countTrim = count.trim();
         const threadsTrim = threads.trim();
         const latencyLimitTrim = latencyLimit.trim();
+        const downloadSpeedTrim = minimumDownloadSpeed.trim();
         let hasError = false;
-        if (ipSource !== 'third' && (!/^\d+$/.test(countTrim) || parseInt(countTrim, 10) < 1)) {
+        if (!/^\d+$/.test(countTrim) || parseInt(countTrim, 10) < 1) {
             setCountError('请输入有效的正整数');
             hasError = true;
         } else {
@@ -165,12 +188,19 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         } else {
             setLatencyLimitError('');
         }
+        if (!/^\d+(\.\d+)?$/.test(downloadSpeedTrim) || Number(downloadSpeedTrim) <= 0) {
+            setDownloadSpeedError('请输入大于 0 的有效网速');
+            hasError = true;
+        } else {
+            setDownloadSpeedError('');
+        }
         if (hasError) return null;
 
         return {
             countNum: parseInt(countTrim, 10),
             threadsNum: parseInt(threadsTrim, 10),
             latencyLimitNum: parseInt(latencyLimitTrim, 10),
+            minimumDownloadSpeedNum: Number(downloadSpeedTrim),
         };
     };
 
@@ -419,10 +449,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 return;
             }
 
-            const scanPort = ipSource === 'third' || selectedPort === 'random' ? 0 : selectedPort;
-            const targetAvailableCount = ipSource === 'third' ? null : val.countNum;
-            const maxRandomCandidates = targetAvailableCount === null
-                ? 0
+            const scanPort = selectedPort === 'random' ? 0 : selectedPort;
+            const targetAvailableCount = val.countNum;
+            const maxCandidateCount = ipSource === 'third'
+                ? prepared.targets.length
                 : targetAvailableCount * MAX_RANDOM_CANDIDATES_PER_RESULT;
             const attemptedIps = new Set<string>();
             let candidates = prepared.targets;
@@ -431,6 +461,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setSuccessCount(0);
             setFailCount(0);
             setTotal(0);
+            setScanStage('latency');
             setIsPreparing(false);
             setIsScanning(true);
             setStartTime(Date.now());
@@ -443,37 +474,45 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
 
             const onProgress = (result: ScanResult) => {
                 setProgress(progress => progress + 1);
-                if (result.isAvailable) setSuccessCount(success => success + 1);
-                else setFailCount(failures => failures + 1);
+                if (!result.isAvailable) setFailCount(failures => failures + 1);
             };
 
             while (candidates.length > 0 && !scanStopRequestedRef.current) {
-                const remainingCount = targetAvailableCount === null
-                    ? candidates.length
-                    : targetAvailableCount - resultsFound.length;
-                const remainingCandidateBudget = maxRandomCandidates === null
-                    ? candidates.length
-                    : maxRandomCandidates - attemptedIps.size;
+                setScanStage('latency');
+                const remainingCount = targetAvailableCount - resultsFound.length;
+                const remainingCandidateBudget = maxCandidateCount - attemptedIps.size;
                 const batchLimit = Math.min(remainingCount, remainingCandidateBudget);
-                const batchCandidates = targetAvailableCount === null
-                    ? candidates
-                    : candidates.filter(ip => !attemptedIps.has(ip)).slice(0, batchLimit);
+                const batchCandidates = candidates.filter(ip => !attemptedIps.has(ip)).slice(0, batchLimit);
 
                 if (batchCandidates.length === 0) break;
-                if (targetAvailableCount !== null) batchCandidates.forEach(ip => attemptedIps.add(ip));
+                batchCandidates.forEach(ip => attemptedIps.add(ip));
 
-                const scanTargets = selectedPort === 'random' && ipSource !== 'third'
-                    ? batchCandidates.map(target => {
+                const scanTargets = batchCandidates.map(target => {
+                    if (selectedPort === 'random') {
                         const randomPort = PORTS_TO_TEST[Math.floor(Math.random() * PORTS_TO_TEST.length)];
+                        if (ipSource === 'third') return replaceTargetPort(target, randomPort);
                         return `${target}:${randomPort}`;
-                    })
-                    : batchCandidates;
+                    }
+                    if (ipSource === 'third') return replaceTargetPort(target, selectedPort);
+                    return target;
+                });
+                const originalResolvedMap = prepared.resolvedMap;
+                const scanResolvedMap = originalResolvedMap
+                    ? { ...originalResolvedMap }
+                    : undefined;
+                if (scanResolvedMap && originalResolvedMap) {
+                    batchCandidates.forEach((target, index) => {
+                        if (Object.prototype.hasOwnProperty.call(originalResolvedMap, target)) {
+                            scanResolvedMap[scanTargets[index]] = originalResolvedMap[target];
+                        }
+                    });
+                }
                 setTotal(total => total + scanTargets.length);
                 await new Promise(resolve => setTimeout(resolve, 0));
 
                 let batchResults: ScanResult[] = [];
                 if (agentReady) {
-                    const agentTargets = buildAgentTargets(scanTargets, prepared.resolvedMap, scanPort);
+                    const agentTargets = buildAgentTargets(scanTargets, scanResolvedMap, scanPort);
                     batchResults = await runAgentScan(agentTargets, val.threadsNum, val.latencyLimitNum, onProgress);
                 } else {
                     const scanner = new BatchScanner(
@@ -483,31 +522,82 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                         val.latencyLimitNum,
                         onProgress,
                         results => { batchResults = results; },
-                        prepared.resolvedMap,
+                        scanResolvedMap,
                     );
                     scannerRef.current = scanner;
                     await scanner.run();
                 }
 
-                if (targetAvailableCount === null) {
-                    resultsFound.push(...batchResults);
-                    break;
+                const speedQualifiedResults: ScanResult[] = [];
+                if (batchResults.length > 0 && !scanStopRequestedRef.current) {
+                    setScanStage('download');
+                    setTotal(total => total + batchResults.length);
+                    const speedController = new AbortController();
+                    speedTestControllerRef.current = speedController;
+                    let speedCursor = 0;
+                    const speedWorker = async () => {
+                        while (!speedController.signal.aborted) {
+                            const result = batchResults[speedCursor++];
+                            if (!result) return;
+
+                            try {
+                                const testIp = result.domain
+                                    ? scanResolvedMap?.[`${result.ip}:${result.port}`] || result.ip
+                                    : result.ip;
+                                const speed = await measureIpDownloadSpeed(
+                                    testIp,
+                                    result.port,
+                                    DOWNLOAD_SPEED_SAMPLE_DURATION_MS,
+                                    speedController.signal,
+                                );
+                                if (speedController.signal.aborted) return;
+
+                                setProgress(progress => progress + 1);
+                                if (speed >= val.minimumDownloadSpeedNum) {
+                                    speedQualifiedResults.push({ ...result, downloadSpeedMBps: speed });
+                                    setSuccessCount(success => success + 1);
+                                } else {
+                                    setFailCount(failures => failures + 1);
+                                }
+                            } catch (error) {
+                                if (speedController.signal.aborted) return;
+                                console.debug(`Download speed test failed for ${result.ip}:${result.port}`, error);
+                                setProgress(progress => progress + 1);
+                                setFailCount(failures => failures + 1);
+                            }
+                        }
+                    };
+
+                    try {
+                        await Promise.all(Array.from(
+                            { length: Math.min(8, val.threadsNum, batchResults.length) },
+                            () => speedWorker(),
+                        ));
+                    } finally {
+                        if (speedTestControllerRef.current === speedController) {
+                            speedTestControllerRef.current = null;
+                        }
+                    }
                 }
 
                 const remainingSlots = targetAvailableCount - resultsFound.length;
-                resultsFound.push(...batchResults.slice(0, remainingSlots));
+                resultsFound.push(...speedQualifiedResults.slice(0, remainingSlots));
                 if (
                     resultsFound.length >= targetAvailableCount ||
                     scanStopRequestedRef.current ||
-                    attemptedIps.size >= maxRandomCandidates
+                    attemptedIps.size >= maxCandidateCount
                 ) break;
 
                 const nextBatchSize = Math.min(
                     targetAvailableCount - resultsFound.length,
-                    maxRandomCandidates - attemptedIps.size,
+                    maxCandidateCount - attemptedIps.size,
                 );
-                const nextBatch = await prepareTargets(nextBatchSize, attemptedIps);
-                candidates = nextBatch?.targets ?? [];
+                if (ipSource === 'third') {
+                    candidates = candidates.filter(ip => !attemptedIps.has(ip));
+                } else {
+                    const nextBatch = await prepareTargets(nextBatchSize, attemptedIps);
+                    candidates = nextBatch?.targets ?? [];
+                }
             }
 
             const sortedResults = resultsFound.sort((a, b) => a.latency - b.latency);
@@ -520,15 +610,17 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setStartTime(null);
             onScanComplete(sortedResults);
 
-            if (targetAvailableCount !== null && resultsFound.length < targetAvailableCount) {
+            if (resultsFound.length < targetAvailableCount) {
                 const reason = scanStopRequestedRef.current
                     ? '已停止'
-                    : attemptedIps.size >= maxRandomCandidates
-                        ? `已达到候选上限 ${maxRandomCandidates}`
+                    : attemptedIps.size >= maxCandidateCount && ipSource === 'third'
+                        ? '第三方源候选已全部测速'
+                        : attemptedIps.size >= maxCandidateCount
+                            ? `已达到随机候选上限 ${maxCandidateCount}`
                         : '未找到更多未测候选 IP';
-                showToast(`${reason}，找到 ${resultsFound.length}/${targetAvailableCount} 个符合延迟限制的 IP`, 'warning');
-            } else if (targetAvailableCount !== null) {
-                showToast(`已找到 ${targetAvailableCount} 个符合延迟限制的 IP`, 'success');
+                showToast(`${reason}，找到 ${resultsFound.length}/${targetAvailableCount} 个符合延迟和网速限制的 IP`, 'warning');
+            } else {
+                showToast(`已找到 ${targetAvailableCount} 个符合延迟和网速限制的 IP`, 'success');
             }
         } catch (error) {
             console.error('Scan failed:', error);
@@ -539,6 +631,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setAgentActive(false);
             agentModeRef.current = false;
             scannerRef.current?.stop();
+            speedTestControllerRef.current?.abort();
+            speedTestControllerRef.current = null;
             setStartTime(null);
             if (scanStarted) onScanComplete(resultsFound.sort((a, b) => a.latency - b.latency));
             showToast('启动测试失败，请检查控制台错误信息', 'error');
@@ -557,6 +651,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         if (scannerRef.current) {
             scannerRef.current.stop();
         }
+        speedTestControllerRef.current?.abort();
     };
 
     const handlePause = () => {
@@ -593,46 +688,21 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP优选测速</h2>
             </div>
             
-            <div className="flex items-center mb-4">
-                <label className="text-gray-700 dark:text-gray-300 font-semibold mr-3">IP来源:</label>
-                <div className="relative flex w-fit items-center rounded-lg bg-gray-100 p-1 dark:bg-gray-700">
-                    <button
-                        onClick={() => setIpSource('cf')}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4 mb-4">
+                <div>
+                    <label htmlFor="ip-source" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">IP来源:</label>
+                    <select
+                        id="ip-source"
+                        value={ipSource}
+                        onChange={(e) => setIpSource(e.target.value as 'cf' | 'cm' | 'third')}
+                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
-                        className={`relative z-10 rounded-md px-4 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${
-                            ipSource === 'cf'
-                                ? 'bg-white text-gray-800 shadow-sm dark:bg-gray-900 dark:text-white'
-                                : 'text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-white'
-                        }`}
                     >
-                        CF官方IP
-                    </button >
-                    <button
-                        onClick={() => setIpSource('cm')}
-                        disabled={isScanning || isPreparing}
-                        className={`relative z-10 rounded-md px-4 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${
-                            ipSource === 'cm'
-                                ? 'bg-white text-gray-800 shadow-sm dark:bg-gray-900 dark:text-white'
-                                : 'text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-white'
-                        }`}
-                    >
-                        CM整理IP
-                    </button>
-                    <button
-                        onClick={() => setIpSource('third')}
-                        disabled={isScanning || isPreparing}
-                        className={`relative z-10 rounded-md px-4 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${
-                            ipSource === 'third'
-                                ? 'bg-white text-gray-800 shadow-sm dark:bg-gray-900 dark:text-white'
-                                : 'text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-white'
-                        }`}
-                    >
-                        第三方IP/域名源
-                    </button>
+                        <option value="cf">CF官方IP</option>
+                        <option value="cm">CM整理IP</option>
+                        <option value="third">第三方IP/域名源</option>
+                    </select>
                 </div>
-            </div >
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
                 <div>
                     <label htmlFor="ip-count" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">目标可用IP数量:</label>
                     <input
@@ -641,14 +711,14 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                         value={count}
                         onChange={(e) => { setCount(e.target.value); if (countError) setCountError(''); }}
                         className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
-                        disabled={isScanning || isPreparing || ipSource === 'third'}
+                        disabled={isScanning || isPreparing}
                     />
                     {countError && <p className="text-red-500 text-xs mt-1">{countError}</p>}
                 </div>
                 <div>
                     <label htmlFor="port-select" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">端口:</label>
-                    <select id="port-select" value={selectedPort} onChange={(e) => setSelectedPort(e.target.value === 'random' ? 'random' : Number(e.target.value))} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing || ipSource === 'third'}>
-                        <option value="random">随机（每 IP 一个）</option>
+                    <select id="port-select" value={selectedPort} onChange={(e) => setSelectedPort(e.target.value === 'random' ? 'random' : Number(e.target.value))} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing}>
+                        <option value="random">随机</option>
                         {PORTS_TO_TEST.map(port => (
                             <option key={port} value={port}>{port}</option>
                         ))}
@@ -677,6 +747,20 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                         disabled={isScanning || isPreparing}
                     />
                     {latencyLimitError && <p className="text-red-500 text-xs mt-1">{latencyLimitError}</p>}
+                </div>
+                <div>
+                    <label htmlFor="minimum-download-speed" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">最低网速(MB/s):</label>
+                    <input
+                        id="minimum-download-speed"
+                        type="number"
+                        min="0.1"
+                        step="0.1"
+                        value={minimumDownloadSpeed}
+                        onChange={(e) => { setMinimumDownloadSpeed(e.target.value); if (downloadSpeedError) setDownloadSpeedError(''); }}
+                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        disabled={isScanning || isPreparing}
+                    />
+                    {downloadSpeedError && <p className="text-red-500 text-xs mt-1">{downloadSpeedError}</p>}
                 </div>
 
             </div>
@@ -917,9 +1001,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 const endRef = isPaused && pausedAt !== null ? pausedAt : now;
                 const elapsedSec = startTime ? Math.floor((endRef - startTime) / 1000) : 0;
                 const requestedCount = Math.max(1, parseInt(count, 10) || 1);
-                const percent = ipSource !== 'third'
-                    ? Math.min(100, Math.round((successCount / requestedCount) * 100))
-                    : total > 0 ? Math.round((progress / total) * 100) : 0;
+                const percent = total > 0 ? Math.min(100, Math.round((progress / total) * 100)) : 0;
                 const fmt = (s: number) => {
                     const m = Math.floor(s / 60);
                     const sec = s % 60;
@@ -933,9 +1015,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                             </span>
                             <div className="flex items-center gap-2">
                                 <span className="text-sm font-medium text-purple-700 dark:text-white mr-1">
-                                    {ipSource !== 'third'
-                                        ? `已测 ${progress}/${total} · 合格 ${successCount}/${requestedCount}`
-                                        : `任务: ${progress} / ${total}`}
+                                    已测 {progress}/{total} · {scanStage === 'latency' ? '延迟测速' : '网速测速'} · 合格 {successCount}/{requestedCount}
                                 </span>
                                 {isPaused ? (
                                     <button
@@ -947,11 +1027,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                                     >
                                         <Play className="w-4 h-4" />
                                     </button>
-                                ) : agentActive ? (
-                                    // 本地 Agent 暂不支持暂停，用不可点状态替代，避免点击无反应
+                                ) : agentActive || scanStage === 'download' ? (
                                     <span
-                                        aria-label="本地 Agent 模式不支持暂停"
-                                        title="本地 Agent 模式暂不支持暂停，可使用「停止测试」"
+                                        aria-label="当前测速阶段不支持暂停"
+                                        title={agentActive ? '本地 Agent 模式暂不支持暂停' : '网速测速期间暂不支持暂停'}
                                         className="p-1.5 rounded-full text-gray-300 bg-gray-100 dark:bg-gray-700 dark:text-gray-500 cursor-not-allowed"
                                     >
                                         <Pause className="w-4 h-4" />
@@ -980,10 +1059,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                             </div>
                         </div>
                         <div className="w-full flex h-2.5 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
-                            <div className="bg-green-500 h-2.5 transition-all duration-300" style={{ width: `${ipSource !== 'third' ? percent : total > 0 ? (successCount / total) * 100 : 0}%` }}></div>
-                            {ipSource === 'third' && (
-                                <div className="bg-red-500 h-2.5 transition-all duration-300" style={{ width: `${total > 0 ? (failCount / total) * 100 : 0}%` }}></div>
-                            )}
+                            <div className="bg-green-500 h-2.5 transition-all duration-300" style={{ width: `${percent}%` }}></div>
                         </div>
                         <div className="flex justify-between text-sm mt-1">
                             <span className="text-green-600">成功: {successCount}</span>

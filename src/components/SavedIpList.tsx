@@ -101,11 +101,13 @@ export function SavedIpList() {
     const filteredItemsSorted = [...filteredItems].sort((a, b) => {
         return a.latency - b.latency;
     });
+    const selectedTestItems = filteredItemsSorted.filter(item => selectedItems.has(getSavedResultKey(item)));
+    const testTargets = selectedTestItems.length > 0 ? selectedTestItems : filteredItemsSorted;
     const isAnyTesting = isDownloadTesting || isLatencyTesting;
 
     const handleDownloadSpeedTest = async () => {
         if (isAnyTesting) return;
-        const targets = [...filteredItemsSorted];
+        const targets = [...testTargets];
         if (targets.length === 0) {
             showToast('当前场景筛选没有可测速的 IP', 'warning');
             return;
@@ -232,7 +234,7 @@ export function SavedIpList() {
 
     const handleLatencyTest = async () => {
         if (isAnyTesting) return;
-        const targets = [...filteredItemsSorted];
+        const targets = [...testTargets];
         if (targets.length === 0) {
             showToast('当前场景筛选没有可测速的 IP', 'warning');
             return;
@@ -518,16 +520,6 @@ export function SavedIpList() {
                         <span className="px-2.5 py-0.5 bg-green-100 text-green-800 text-sm font-semibold rounded-full dark:bg-green-900 dark:text-green-300">{items.length} 个IP/域名</span>
                     </div>
                     <div className="flex items-center gap-4">
-                        {selectedItems.size > 0 && (
-                            <button
-                                onClick={handleDeleteSelected}
-                                disabled={isAnyTesting}
-                                className="px-4 py-1.5 text-sm font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                <Trash2 className="w-4 h-4 mr-1 inline-block" />
-                                删除选中 ({selectedItems.size})
-                            </button>
-                        )}
                         <button
                             onClick={loadData}
                             disabled={loading || isAnyTesting}
@@ -587,76 +579,89 @@ export function SavedIpList() {
                 </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3 mb-4">
-                <label htmlFor="saved-download-duration" className="text-sm text-gray-600 dark:text-gray-300">单 IP 取样</label>
-                <select
-                    id="saved-download-duration"
-                    value={downloadDuration}
-                    onChange={(e) => setDownloadDuration(e.target.value)}
-                    disabled={isAnyTesting}
-                    className="p-1.5 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white disabled:opacity-60"
-                >
-                    <option value="3000">3 秒</option>
-                    <option value="5000">5 秒</option>
-                    <option value="10000">10 秒</option>
-                </select>
-                {isDownloadTesting ? (
-                    <button
-                        type="button"
-                        onClick={handleStopDownloadTest}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+            <div className="mb-4 space-y-2">
+                <div className="flex flex-wrap items-center gap-2.5">
+                    <label htmlFor="saved-download-duration" className="text-sm text-gray-600 dark:text-gray-300">单 IP 取样</label>
+                    <select
+                        id="saved-download-duration"
+                        value={downloadDuration}
+                        onChange={(e) => setDownloadDuration(e.target.value)}
+                        disabled={isAnyTesting}
+                        className="p-1.5 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white disabled:opacity-60"
                     >
-                        <StopCircle className="w-4 h-4" />
-                        停止测速
-                    </button>
-                ) : (
-                    <button
-                        type="button"
-                        onClick={handleDownloadSpeedTest}
-                        disabled={loading || isLatencyTesting || filteredItemsSorted.length === 0}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
-                    >
-                        <Gauge className="w-4 h-4" />
-                        测下载速度 ({filteredItemsSorted.length})
-                    </button>
-                )}
-                {isDownloadTesting && (
-                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">
-                        {downloadProgress.completed}/{downloadProgress.total}
-                        {downloadProgress.currentIp ? ` · ${downloadProgress.currentIp}` : ''}
-                    </span>
-                )}
-                {!isDownloadTesting && downloadTestMessage && (
-                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">{downloadTestMessage}</span>
-                )}
-                {isLatencyTesting ? (
-                    <button
-                        type="button"
-                        onClick={handleStopLatencyTest}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
-                    >
-                        <StopCircle className="w-4 h-4" />
-                        停止延迟测试
-                    </button>
-                ) : (
-                    <button
-                        type="button"
-                        onClick={handleLatencyTest}
-                        disabled={loading || isDownloadTesting || filteredItemsSorted.length === 0}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-teal-600 rounded hover:bg-teal-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
-                    >
-                        <Gauge className="w-4 h-4" />
-                        测延迟 ({filteredItemsSorted.length})
-                    </button>
-                )}
-                {isLatencyTesting && (
-                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">
-                        {latencyProgress.completed}/{latencyProgress.total}
-                        {latencyProgress.currentIp ? ` · ${latencyProgress.currentIp}` : ''}
-                    </span>
-                )}
-                {!isLatencyTesting && latencyTestMessage && (
-                    <span className="text-sm text-gray-600 dark:text-gray-300" role="status">{latencyTestMessage}</span>
+                        <option value="3000">3 秒</option>
+                        <option value="5000">5 秒</option>
+                        <option value="10000">10 秒</option>
+                    </select>
+                    {selectedItems.size > 0 && (
+                        <button
+                            type="button"
+                            onClick={handleDeleteSelected}
+                            disabled={isAnyTesting}
+                            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-800 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            <Trash2 className="w-4 h-4" />
+                            删除选中 ({selectedItems.size})
+                        </button>
+                    )}
+                    {isDownloadTesting ? (
+                        <button
+                            type="button"
+                            onClick={handleStopDownloadTest}
+                            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                        >
+                            <StopCircle className="w-4 h-4" />
+                            停止测速
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={handleDownloadSpeedTest}
+                            disabled={loading || isLatencyTesting || testTargets.length === 0}
+                            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                        >
+                            <Gauge className="w-4 h-4" />
+                            测下载速度 ({testTargets.length})
+                        </button>
+                    )}
+                    {isLatencyTesting ? (
+                        <button
+                            type="button"
+                            onClick={handleStopLatencyTest}
+                            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 bg-red-100 rounded hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-900"
+                        >
+                            <StopCircle className="w-4 h-4" />
+                            停止延迟测试
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={handleLatencyTest}
+                            disabled={loading || isDownloadTesting || testTargets.length === 0}
+                            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-teal-600 rounded hover:bg-teal-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                        >
+                            <Gauge className="w-4 h-4" />
+                            测延迟 ({testTargets.length})
+                        </button>
+                    )}
+                </div>
+                {(isDownloadTesting || downloadTestMessage || isLatencyTesting || latencyTestMessage) && (
+                    <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-gray-600 dark:text-gray-300" aria-live="polite">
+                        {(isDownloadTesting || downloadTestMessage) && (
+                            <span role="status">
+                                {isDownloadTesting
+                                    ? `测速 ${downloadProgress.completed}/${downloadProgress.total}${downloadProgress.currentIp ? ` · ${downloadProgress.currentIp}` : ''}`
+                                    : downloadTestMessage}
+                            </span>
+                        )}
+                        {(isLatencyTesting || latencyTestMessage) && (
+                            <span role="status">
+                                {isLatencyTesting
+                                    ? `延迟 ${latencyProgress.completed}/${latencyProgress.total}${latencyProgress.currentIp ? ` · ${latencyProgress.currentIp}` : ''}`
+                                    : latencyTestMessage}
+                            </span>
+                        )}
+                    </div>
                 )}
             </div>
 
