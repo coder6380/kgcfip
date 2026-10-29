@@ -30,6 +30,8 @@ type LatencyMeasurement = {
 };
 
 const getResultKey = (result: Pick<ScanResult, 'ip' | 'port'>) => `${result.ip}:${result.port}`;
+const uniqueResultsByEndpoint = (results: ScanResult[]) =>
+    Array.from(new Map(results.map(result => [getResultKey(result), result])).values());
 
 export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsAndSaveProps) {
     const [ipsPerRegion, setIpsPerRegion] = useState<string>(String(DEFAULT_IPS_PER_REGION));
@@ -193,9 +195,16 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         }
         return leftLatency - rightLatency;
     });
+    const rowOccurrences = new Map<string, number>();
+    const sortedResultsWithKeys = sortedResults.map(result => {
+        const resultKey = getResultKey(result);
+        const occurrence = rowOccurrences.get(resultKey) ?? 0;
+        rowOccurrences.set(resultKey, occurrence + 1);
+        return { result, resultKey, rowKey: `${resultKey}#${occurrence}` };
+    });
     const selectedVisibleResults = limitedResults.filter(result => selectedResults.has(getResultKey(result)));
     const downloadSpeedTestTargets = selectedVisibleResults.length > 0 ? selectedVisibleResults : regionLimitedResults;
-    const latencyTestTargets = selectedVisibleResults.length > 0 ? selectedVisibleResults : limitedResults;
+    const latencyTestTargets = uniqueResultsByEndpoint(selectedVisibleResults.length > 0 ? selectedVisibleResults : limitedResults);
     const areAllVisibleResultsSelected = limitedResults.length > 0
         && limitedResults.every(result => selectedResults.has(getResultKey(result)));
 
@@ -712,16 +721,17 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {sortedResults.map(({ ip, port, latency, colo, domain, downloadSpeedMBps, downloadSpeedError }) => {
-                                const measurement = downloadMeasurements[getResultKey({ ip, port })];
-                                const latencyMeasurement = latencyMeasurements[getResultKey({ ip, port })];
+                            {sortedResultsWithKeys.map(({ result, resultKey, rowKey }) => {
+                                const { ip, port, latency, colo, domain, downloadSpeedMBps, downloadSpeedError } = result;
+                                const measurement = downloadMeasurements[resultKey];
+                                const latencyMeasurement = latencyMeasurements[resultKey];
                                 const measuredSpeed = measurement?.status === 'done'
                                     ? measurement.speed
                                     : measurement?.status === 'error'
                                         ? undefined
                                         : (typeof downloadSpeedMBps === 'number' ? downloadSpeedMBps : undefined);
                                 return (
-                                <tr key={`${ip}:${port}`} className="hover:bg-gray-100 dark:hover:bg-gray-700">
+                                <tr key={rowKey} className="hover:bg-gray-100 dark:hover:bg-gray-700">
                                     <td className="px-4 py-2">
                                         <input
                                             type="checkbox"
@@ -763,7 +773,8 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{colo ? <RegionDisplay colo={colo} flagSize="sm" /> : '-'}</td>
                                 </tr>
-                            );})}
+                            );
+                            })}
                         </tbody>
                     </table>
                 </div>
