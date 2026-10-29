@@ -621,7 +621,7 @@ export function SavedIpList() {
                             className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
                         >
                             <Gauge className="w-4 h-4" />
-                            测下载速度 ({testTargets.length})
+                            下载测速 ({testTargets.length})
                         </button>
                     )}
                     {isLatencyTesting ? (

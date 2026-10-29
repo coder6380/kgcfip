@@ -51,6 +51,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const [minimumDownloadSpeed, setMinimumDownloadSpeed] = useState('5');
     const [downloadDuration, setDownloadDuration] = useState('3000');
     const [isDownloadTesting, setIsDownloadTesting] = useState(false);
+    const [resultSortMode, setResultSortMode] = useState<'latency' | 'downloadSpeed'>('latency');
     const [downloadProgress, setDownloadProgress] = useState({ completed: 0, total: 0, currentIp: '' });
     const [downloadTestMessage, setDownloadTestMessage] = useState('');
     const [downloadMeasurements, setDownloadMeasurements] = useState<Record<string, DownloadMeasurement>>({});
@@ -178,7 +179,22 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         const speed = getResultDownloadSpeed(result);
         return isMinimumDownloadSpeedValid && typeof speed === 'number' && speed >= minimumDownloadSpeedValue;
     });
+    const sortedResults = [...limitedResults].sort((left, right) => {
+        const leftLatency = left.latency > 0 ? left.latency : Number.POSITIVE_INFINITY;
+        const rightLatency = right.latency > 0 ? right.latency : Number.POSITIVE_INFINITY;
+        if (resultSortMode === 'downloadSpeed') {
+            const leftSpeed = getResultDownloadSpeed(left);
+            const rightSpeed = getResultDownloadSpeed(right);
+            if (leftSpeed === undefined && rightSpeed !== undefined) return 1;
+            if (leftSpeed !== undefined && rightSpeed === undefined) return -1;
+            if (leftSpeed !== undefined && rightSpeed !== undefined && leftSpeed !== rightSpeed) {
+                return rightSpeed - leftSpeed;
+            }
+        }
+        return leftLatency - rightLatency;
+    });
     const selectedVisibleResults = limitedResults.filter(result => selectedResults.has(getResultKey(result)));
+    const downloadSpeedTestTargets = selectedVisibleResults.length > 0 ? selectedVisibleResults : regionLimitedResults;
     const latencyTestTargets = selectedVisibleResults.length > 0 ? selectedVisibleResults : limitedResults;
     const areAllVisibleResultsSelected = limitedResults.length > 0
         && limitedResults.every(result => selectedResults.has(getResultKey(result)));
@@ -190,18 +206,23 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         latencyControllerRef.current?.abort();
     }, []);
     useEffect(() => {
+        if (scanResults.length > 0) return;
         setSelectedResults(new Set());
         setLatencyMeasurements({});
+        setDownloadMeasurements({});
+        setResultSortMode('latency');
+        downloadControllerRef.current?.abort();
         latencyControllerRef.current?.abort();
     }, [scanResults]);
 
     const handleDownloadSpeedTest = async () => {
-        const targets = [...regionLimitedResults];
+        const targets = [...downloadSpeedTestTargets];
         if (targets.length === 0) {
             showToast('当前筛选列表没有可测速的 IP', 'warning');
             return;
         }
 
+        setResultSortMode('downloadSpeed');
         const controller = new AbortController();
         downloadControllerRef.current = controller;
         setIsDownloadTesting(true);
@@ -277,6 +298,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
             return;
         }
 
+        setResultSortMode('latency');
         const controller = new AbortController();
         latencyControllerRef.current = controller;
         setIsLatencyTesting(true);
@@ -610,11 +632,11 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                 <button
                                     type="button"
                                     onClick={handleDownloadSpeedTest}
-                                    disabled={isLatencyTesting || regionLimitedResults.length === 0}
+                                    disabled={isLatencyTesting || downloadSpeedTestTargets.length === 0}
                                     className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
                                 >
                                     <Gauge className="w-4 h-4" />
-                                    下载测速 ({regionLimitedResults.length})
+                                    下载测速 ({downloadSpeedTestTargets.length})
                                 </button>
                             )}
                             {isLatencyTesting ? (
@@ -634,7 +656,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-teal-600 rounded hover:bg-teal-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
                                 >
                                     <RefreshCw className="w-4 h-4" />
-                                    重测延迟 ({latencyTestTargets.length})
+                                    测延迟 ({latencyTestTargets.length})
                                 </button>
                             )}
                         </div>
@@ -690,7 +712,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {limitedResults.map(({ ip, port, latency, colo, domain, downloadSpeedMBps, downloadSpeedError }) => {
+                            {sortedResults.map(({ ip, port, latency, colo, domain, downloadSpeedMBps, downloadSpeedError }) => {
                                 const measurement = downloadMeasurements[getResultKey({ ip, port })];
                                 const latencyMeasurement = latencyMeasurements[getResultKey({ ip, port })];
                                 const measuredSpeed = measurement?.status === 'done'

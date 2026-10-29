@@ -13,6 +13,7 @@ interface SourceRow {
 import {
     generateRandomIps,
     BatchScanner,
+    BROWSER_LATENCY_TIMEOUT_MS,
     ScanResult,
     CF_CIDR_LIST,
     isDomainName,
@@ -31,6 +32,7 @@ import { useConfirm } from './ConfirmDialog';
 interface IpScannerConfigAndControlProps {
     cfIps: CloudflareIps | null;
     onScanComplete: (results: ScanResult[]) => void;
+    onScanProgress: (results: ScanResult[]) => void;
 }
 
 const PORTS_TO_TEST = [80, 443, 8080, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8443];
@@ -52,10 +54,10 @@ const replaceTargetPort = (target: string, port: number) => {
     return `${host}:${port}`;
 };
 
-export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndControlProps) {
+export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScannerConfigAndControlProps) {
     const [count, setCount] = useState<string>('50');
-    const [threads, setThreads] = useState<string>('8');
-    const [latencyLimit, setLatencyLimit] = useState<string>('500');
+    const [threads, setThreads] = useState<string>('16');
+    const [latencyLimit, setLatencyLimit] = useState<string>('1000');
 /*  */    const [countError, setCountError] = useState<string>('');
     const [threadsError, setThreadsError] = useState<string>('');
     const [latencyLimitError, setLatencyLimitError] = useState<string>('');
@@ -175,8 +177,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         } else {
             setThreadsError('');
         }
-        if (!/^\d+$/.test(latencyLimitTrim)) {
-            setLatencyLimitError('请输入有效的正整数');
+        if (!/^\d+$/.test(latencyLimitTrim) || parseInt(latencyLimitTrim, 10) < 1 || parseInt(latencyLimitTrim, 10) > BROWSER_LATENCY_TIMEOUT_MS) {
+            setLatencyLimitError(`请输入 1 到 ${BROWSER_LATENCY_TIMEOUT_MS} 之间的整数`);
             hasError = true;
         } else {
             setLatencyLimitError('');
@@ -429,7 +431,11 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 return;
             }
 
-            const prepared = await prepareTargets(val.countNum);
+            const browserScanWillRun = activeTab !== 'local' || agentProbe?.online !== true;
+            const candidateTargetCount = browserScanWillRun && ipSource !== 'third'
+                ? val.countNum * MAX_RANDOM_CANDIDATES_PER_RESULT
+                : val.countNum;
+            const prepared = await prepareTargets(candidateTargetCount);
             if (!prepared || prepared.targets.length === 0 || cancelPreparingRef.current) {
                 setIsPreparing(false);
                 return;
@@ -443,6 +449,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             const attemptedIps = new Set<string>();
             let candidates = prepared.targets;
 
+            onScanComplete([]);
             setProgress(0);
             setSuccessCount(0);
             setFailCount(0);
@@ -457,16 +464,26 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             agentModeRef.current = agentReady;
             setAgentActive(agentReady);
 
+            let scanAttemptCount = 0;
             const onProgress = (result: ScanResult) => {
-                setProgress(progress => progress + 1);
-                if (result.isAvailable) setSuccessCount(success => success + 1);
-                else setFailCount(failures => failures + 1);
+                scanAttemptCount++;
+                setProgress(scanAttemptCount);
+                if (result.isAvailable) {
+                    setSuccessCount(success => success + 1);
+                    resultsFound.push(result);
+                    resultsFound.sort((a, b) => a.latency - b.latency);
+                    onScanProgress([...resultsFound]);
+                } else {
+                    setFailCount(failures => failures + 1);
+                }
             };
 
             while (candidates.length > 0 && !scanStopRequestedRef.current) {
                 const remainingCount = targetAvailableCount - resultsFound.length;
                 const remainingCandidateBudget = maxCandidateCount - attemptedIps.size;
-                const batchLimit = Math.min(remainingCount, remainingCandidateBudget);
+                const batchLimit = agentReady
+                    ? Math.min(remainingCount, remainingCandidateBudget)
+                    : candidates.length;
                 const batchCandidates = candidates.filter(ip => !attemptedIps.has(ip)).slice(0, batchLimit);
 
                 if (batchCandidates.length === 0) break;
@@ -495,10 +512,9 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 setTotal(total => total + scanTargets.length);
                 await new Promise(resolve => setTimeout(resolve, 0));
 
-                let batchResults: ScanResult[] = [];
                 if (agentReady) {
                     const agentTargets = buildAgentTargets(scanTargets, scanResolvedMap, scanPort);
-                    batchResults = await runAgentScan(agentTargets, val.threadsNum, val.latencyLimitNum, onProgress);
+                    await runAgentScan(agentTargets, val.threadsNum, val.latencyLimitNum, onProgress);
                 } else {
                     const scanner = new BatchScanner(
                         scanTargets,
@@ -506,15 +522,14 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                         val.threadsNum,
                         val.latencyLimitNum,
                         onProgress,
-                        results => { batchResults = results; },
+                        () => {},
                         scanResolvedMap,
+                        targetAvailableCount,
                     );
                     scannerRef.current = scanner;
                     await scanner.run();
                 }
 
-                const remainingSlots = targetAvailableCount - resultsFound.length;
-                resultsFound.push(...batchResults.slice(0, remainingSlots));
                 if (
                     resultsFound.length >= targetAvailableCount ||
                     scanStopRequestedRef.current ||
@@ -534,6 +549,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             }
 
             const sortedResults = resultsFound.sort((a, b) => a.latency - b.latency);
+            setTotal(scanAttemptCount);
+            setProgress(scanAttemptCount);
             setIsStopping(false);
             setIsPaused(false);
             setAgentActive(false);
@@ -671,8 +688,18 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                     <input
                         id="latency-limit"
                         type="text"
+                        inputMode="numeric"
+                        maxLength={4}
                         value={latencyLimit}
-                        onChange={(e) => { setLatencyLimit(e.target.value); if (latencyLimitError) setLatencyLimitError(''); }}
+                        onChange={(e) => {
+                            const value = e.target.value;
+                            setLatencyLimit(
+                                /^\d+$/.test(value) && Number(value) > BROWSER_LATENCY_TIMEOUT_MS
+                                    ? String(BROWSER_LATENCY_TIMEOUT_MS)
+                                    : value
+                            );
+                            if (latencyLimitError) setLatencyLimitError('');
+                        }}
                         className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
@@ -846,6 +873,87 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 )}
             </div >
 
+            {isScanning && (() => {
+                const endRef = isPaused && pausedAt !== null ? pausedAt : now;
+                const elapsedSec = startTime ? Math.floor((endRef - startTime) / 1000) : 0;
+                const requestedCount = Math.max(1, parseInt(count, 10) || 1);
+                const percent = Math.min(100, Math.round((successCount / requestedCount) * 100));
+                const fmt = (s: number) => {
+                    const m = Math.floor(s / 60);
+                    const sec = s % 60;
+                    return `${m}:${sec.toString().padStart(2, '0')}`;
+                };
+                return (
+                    <div className="mb-4 w-full border-y border-gray-200 py-4 dark:border-gray-700">
+                        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+                            <div className="flex min-w-0 items-center gap-3">
+                                <span className="text-xl font-semibold tabular-nums text-purple-700 dark:text-purple-300">{percent}%</span>
+                                <div className="text-sm">
+                                    <div className="font-semibold text-gray-800 dark:text-gray-100">测速进度</div>
+                                    <div className="text-gray-500 dark:text-gray-400">已测 {progress} / {total}，合格 {successCount} / {requestedCount}</div>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {isPaused ? (
+                                    <button
+                                        type="button"
+                                        onClick={handleResume}
+                                        aria-label="继续测试"
+                                        title="继续测试"
+                                        className="flex h-9 w-9 items-center justify-center rounded-md bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/50 dark:text-green-300 dark:hover:bg-green-800/50"
+                                    >
+                                        <Play className="w-4 h-4" />
+                                    </button>
+                                ) : agentActive ? (
+                                    <span
+                                        aria-label="本地 Agent 模式不支持暂停"
+                                        title="本地 Agent 模式暂不支持暂停，可使用「停止测试」"
+                                        className="flex h-9 w-9 cursor-not-allowed items-center justify-center rounded-md bg-gray-100 text-gray-300 dark:bg-gray-700 dark:text-gray-500"
+                                    >
+                                        <Pause className="w-4 h-4" />
+                                    </span>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        onClick={handlePause}
+                                        aria-label="暂停测试"
+                                        title="暂停测试"
+                                        className="flex h-9 w-9 items-center justify-center rounded-md bg-yellow-100 text-yellow-700 hover:bg-yellow-200 dark:bg-yellow-900/50 dark:text-yellow-300 dark:hover:bg-yellow-800/50"
+                                    >
+                                        <Pause className="w-4 h-4" />
+                                    </button>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={handleStopScan}
+                                    disabled={isStopping}
+                                    aria-label="停止测试"
+                                    title="停止测试"
+                                    className="flex h-9 w-9 items-center justify-center rounded-md bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-800/50 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                    <Square className="w-4 h-4" />
+                                </button>
+                            </div>
+                        </div>
+                        <div
+                            className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"
+                            role="progressbar"
+                            aria-label="测速进度"
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={percent}
+                        >
+                            <div className="h-full rounded-full bg-green-500 transition-all duration-300" style={{ width: `${percent}%` }} />
+                        </div>
+                        <div className="mt-2 grid grid-cols-3 gap-2 text-xs sm:text-sm">
+                            <span className="text-green-700 dark:text-green-400">成功 {successCount}</span>
+                            <span className="text-center text-gray-600 dark:text-gray-400">已用 {fmt(elapsedSec)}</span>
+                            <span className="text-right text-red-700 dark:text-red-400">失败 {failCount}</span>
+                        </div>
+                    </div>
+                );
+            })()}
+
             {/* 第三方源逐条解析展示区 */}
             {ipSource === 'third' && sourceRows.length > 0 && (
                 <div className="mb-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3 border border-gray-100 dark:border-gray-700">
@@ -912,78 +1020,6 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 </div>
             )}
 
-            {isScanning && (() => {
-                const endRef = isPaused && pausedAt !== null ? pausedAt : now;
-                const elapsedSec = startTime ? Math.floor((endRef - startTime) / 1000) : 0;
-                const requestedCount = Math.max(1, parseInt(count, 10) || 1);
-                const percent = Math.min(100, Math.round((successCount / requestedCount) * 100));
-                const fmt = (s: number) => {
-                    const m = Math.floor(s / 60);
-                    const sec = s % 60;
-                    return `${m}:${sec.toString().padStart(2, '0')}`;
-                };
-                return (
-                    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30 w-[calc(100%-2rem)] max-w-xl px-5 py-3 rounded-xl bg-white/95 dark:bg-gray-800/95 backdrop-blur border border-gray-200 dark:border-gray-700 shadow-[0_-4px_16px_rgba(0,0,0,0.12)]">
-                        <div className="flex justify-between items-center mb-1">
-                            <span className="text-base font-medium text-purple-700 dark:text-white">
-                                进度 {percent}%
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <span className="text-sm font-medium text-purple-700 dark:text-white mr-1">
-                                    已测 {progress}/{total} · 合格 {successCount}/{requestedCount}
-                                </span>
-                                {isPaused ? (
-                                    <button
-                                        type="button"
-                                        onClick={handleResume}
-                                        aria-label="继续测试"
-                                        title="继续测试"
-                                        className="p-1.5 rounded-full text-green-600 bg-green-100 hover:bg-green-200 dark:bg-green-900/50 dark:text-green-300 dark:hover:bg-green-800/50 transition-colors"
-                                    >
-                                        <Play className="w-4 h-4" />
-                                    </button>
-                                ) : agentActive ? (
-                                    <span
-                                        aria-label="本地 Agent 模式不支持暂停"
-                                        title="本地 Agent 模式暂不支持暂停，可使用「停止测试」"
-                                        className="p-1.5 rounded-full text-gray-300 bg-gray-100 dark:bg-gray-700 dark:text-gray-500 cursor-not-allowed"
-                                    >
-                                        <Pause className="w-4 h-4" />
-                                    </span>
-                                ) : (
-                                    <button
-                                        type="button"
-                                        onClick={handlePause}
-                                        aria-label="暂停测试"
-                                        title="暂停测试"
-                                        className="p-1.5 rounded-full text-yellow-600 bg-yellow-100 hover:bg-yellow-200 dark:bg-yellow-900/50 dark:text-yellow-300 dark:hover:bg-yellow-800/50 transition-colors"
-                                    >
-                                        <Pause className="w-4 h-4" />
-                                    </button>
-                                )}
-                                <button
-                                    type="button"
-                                    onClick={handleStopScan}
-                                    disabled={isStopping}
-                                    aria-label="停止测试"
-                                    title="停止测试"
-                                    className="p-1.5 rounded-full text-red-600 bg-red-100 hover:bg-red-200 dark:bg-red-900/50 dark:text-red-300 dark:hover:bg-red-800/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    <Square className="w-4 h-4" />
-                                </button>
-                            </div>
-                        </div>
-                        <div className="w-full flex h-2.5 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
-                            <div className="bg-green-500 h-2.5 transition-all duration-300" style={{ width: `${percent}%` }}></div>
-                        </div>
-                        <div className="flex justify-between text-sm mt-1">
-                            <span className="text-green-600">成功: {successCount}</span>
-                            <span className="text-gray-500 dark:text-gray-400">已用: {fmt(elapsedSec)}</span>
-                            <span className="text-red-600">失败: {failCount}</span>
-                        </div>
-                    </div>
-                );
-            })()}
         </div >
     );
 }

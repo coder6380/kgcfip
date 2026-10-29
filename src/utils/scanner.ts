@@ -184,8 +184,8 @@ export async function measureIpDownloadSpeed(
     return receivedBytes / 1_000_000 / elapsedSeconds;
 }
 
-/** Browser request timeout, independent of the latency acceptance limit. */
-export const BROWSER_LATENCY_TIMEOUT_MS = 5000;
+/** Maximum timeout for browser latency requests. */
+export const BROWSER_LATENCY_TIMEOUT_MS = 3000;
 
 export interface IpLatencyMeasurement {
     latency: number;
@@ -300,6 +300,7 @@ export class BatchScanner {
     private onProgress: (result: ScanResult) => void;
     private onComplete: (results: ScanResult[]) => void;
     private abortController: AbortController;
+    private targetAvailableCount?: number;
     // 解析出的测速IP映射：key 为 "host:port"，value 为实际用于测速的IP（域名解析后）
     private resolvedMap?: Record<string, string | null>;
     private paused = false;
@@ -312,7 +313,8 @@ export class BatchScanner {
         latencyLimit: number,
         onProgress: (result: ScanResult) => void,
         onComplete: (results: ScanResult[]) => void,
-        resolvedMap?: Record<string, string | null>
+        resolvedMap?: Record<string, string | null>,
+        targetAvailableCount?: number,
     ) {
         this.ips = ips;
         this.port = port;
@@ -322,6 +324,7 @@ export class BatchScanner {
         this.onComplete = onComplete;
         this.abortController = new AbortController();
         this.resolvedMap = resolvedMap;
+        this.targetAvailableCount = targetAvailableCount;
     }
 
     public stop() {
@@ -368,6 +371,8 @@ export class BatchScanner {
     public async run() {
         const queue = [...this.ips];
         const finalResults: ScanResult[] = [];
+        let availableCount = 0;
+        const requestTimeout = Math.max(1, Math.min(this.latencyLimit, BROWSER_LATENCY_TIMEOUT_MS));
 
         const worker = async () => {
             while (queue.length > 0) {
@@ -388,7 +393,10 @@ export class BatchScanner {
                 let isDomain = false;
                 if (isDomainName(host)) {
                     isDomain = true;
-                    const resolved = this.resolvedMap ? (this.resolvedMap[rawTarget] ?? null) : await resolveDomainToIp(host);
+                    const resolved = this.resolvedMap
+                        ? (this.resolvedMap[rawTarget] ?? null)
+                        : await resolveDomainToIp(host, this.abortController.signal);
+                    if (this.abortController.signal.aborted) break;
                     if (!resolved) {
                         const fail: ScanResult = {
                             ip: host,
@@ -405,7 +413,13 @@ export class BatchScanner {
                     testHost = resolved;
                 }
 
-                const { latency, colo, error } = await measureIpLatency(testHost, port);
+                const { latency, colo, error } = await measureIpLatency(
+                    testHost,
+                    port,
+                    requestTimeout,
+                    this.abortController.signal,
+                );
+                if (this.abortController.signal.aborted) break;
 
                 const result: ScanResult = {
                     ip: isDomain ? host : testHost, // 域名源保存域名，IP源保存IP
@@ -419,6 +433,12 @@ export class BatchScanner {
 
                 finalResults.push(result);
                 this.onProgress(result);
+                if (result.isAvailable) {
+                    availableCount++;
+                    if (this.targetAvailableCount !== undefined && availableCount >= this.targetAvailableCount) {
+                        this.abortController.abort();
+                    }
+                }
             }
         };
 
