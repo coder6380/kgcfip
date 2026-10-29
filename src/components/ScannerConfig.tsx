@@ -36,7 +36,24 @@ interface IpScannerConfigAndControlProps {
 }
 
 const PORTS_TO_TEST = [80, 443, 8080, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8443];
-const MAX_RANDOM_CANDIDATES_PER_RESULT = 20;
+const RANDOM_CANDIDATES_PER_BATCH = 20;
+
+const getSourceUrlForExpansionRound = (sourceUrl: string, round: number) => {
+    if (round <= 0) return sourceUrl;
+
+    try {
+        const url = new URL(sourceUrl);
+        const currentLimit = Number(url.searchParams.get('limit'));
+        if (!Number.isSafeInteger(currentLimit) || currentLimit < 1) return sourceUrl;
+
+        const expandedLimit = Math.min(Number.MAX_SAFE_INTEGER, currentLimit * (2 ** round));
+        if (expandedLimit <= currentLimit) return sourceUrl;
+        url.searchParams.set('limit', String(expandedLimit));
+        return url.toString();
+    } catch {
+        return sourceUrl;
+    }
+};
 
 const replaceTargetPort = (target: string, port: number) => {
     const lastColonIndex = target.lastIndexOf(':');
@@ -211,6 +228,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
     const prepareTargets = async (
         countNum: number,
         excludedIps: ReadonlySet<string> = new Set(),
+        sourceExpansionRound = 0,
     ): Promise<{ targets: string[]; resolvedMap?: Record<string, string | null> } | null> => {
         setSourceRows([]);
         setUniqueIpCount(0);
@@ -225,23 +243,29 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             setPrepareTotal(0);
 
             // 先取出完整源列表，立即以"等待中"渲染全部条目
-            const sources = await getThirdPartySourceList();
+            const configuredSources = await getThirdPartySourceList();
             if (cancelPreparingRef.current) return null;
-            if (!Array.isArray(sources) || sources.length === 0) {
+            if (!Array.isArray(configuredSources) || configuredSources.length === 0) {
                 showToast('未配置第三方源，请先到"第三方IP/域名源"中添加', 'warning');
                 return null;
             }
 
-            const rows: SourceRow[] = sources.map((url) => ({ url, status: 'pending' }));
+            const sources = configuredSources
+                .map(source => source.replace(/^\uFEFF/, '').trim())
+                .filter(source => source !== '' && !source.startsWith('#'));
+            if (sources.length === 0) return null;
+
+            const requestSources = sources.map(url => getSourceUrlForExpansionRound(url, sourceExpansionRound));
+            const rows: SourceRow[] = requestSources.map((url) => ({ url, status: 'pending' }));
             setSourceRows(rows);
-            setPrepareTotal(sources.length);
+            setPrepareTotal(requestSources.length);
 
             // 逐源解析，实时更新对应条目的状态与结果
             const allIps = new Map<string, { ip: string; port: number }>();
             let grossCount = 0;
             let doneCount = 0;
 
-            for (let i = 0; i < sources.length; i++) {
+            for (let i = 0; i < requestSources.length; i++) {
                 if (cancelPreparingRef.current) return null;
                 // 标记当前行为"解析中"
                 setSourceRows((prev) => prev.map((r, idx) => idx === i ? { ...r, status: 'loading' } : r));
@@ -249,9 +273,9 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
 
                 let stat;
                 try {
-                    stat = await getThirdPartySourceIps(sources[i]);
+                    stat = await getThirdPartySourceIps(requestSources[i]);
                 } catch (e) {
-                    stat = { url: sources[i], status: 'error', count: 0, ipCount: 0, domainCount: 0, ips: [], error: (e as Error).message };
+                    stat = { url: requestSources[i], status: 'error', count: 0, ipCount: 0, domainCount: 0, ips: [], error: (e as Error).message };
                 }
 
                 // 更新当前行结果
@@ -298,6 +322,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             const domainItems: { key: string; host: string }[] = [];
             for (const item of finalIps) {
                 const key = `${item.ip}:${item.port}`;
+                if (excludedIps.has(key)) continue;
                 targets.push(key);
                 // 收集域名源，前端用阿里云 DoH 解析出测速 IP
                 if (isDomainName(item.ip)) domainItems.push({ key, host: item.ip });
@@ -432,10 +457,10 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             }
 
             const browserScanWillRun = activeTab !== 'local' || agentProbe?.online !== true;
-            const candidateTargetCount = browserScanWillRun && ipSource !== 'third'
-                ? val.countNum * MAX_RANDOM_CANDIDATES_PER_RESULT
+            const candidateBatchSize = browserScanWillRun && ipSource !== 'third'
+                ? val.countNum * RANDOM_CANDIDATES_PER_BATCH
                 : val.countNum;
-            const prepared = await prepareTargets(candidateTargetCount);
+            const prepared = await prepareTargets(candidateBatchSize);
             if (!prepared || prepared.targets.length === 0 || cancelPreparingRef.current) {
                 setIsPreparing(false);
                 return;
@@ -443,11 +468,10 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
 
             const scanPort = selectedPort === 'random' ? 0 : selectedPort;
             const targetAvailableCount = val.countNum;
-            const maxCandidateCount = ipSource === 'third'
-                ? prepared.targets.length
-                : targetAvailableCount * MAX_RANDOM_CANDIDATES_PER_RESULT;
             const attemptedIps = new Set<string>();
             let candidates = prepared.targets;
+            let resolvedMap = prepared.resolvedMap;
+            let sourceExpansionRound = 0;
 
             onScanComplete([]);
             setProgress(0);
@@ -480,9 +504,8 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
 
             while (candidates.length > 0 && !scanStopRequestedRef.current) {
                 const remainingCount = targetAvailableCount - resultsFound.length;
-                const remainingCandidateBudget = maxCandidateCount - attemptedIps.size;
                 const batchLimit = agentReady
-                    ? Math.min(remainingCount, remainingCandidateBudget)
+                    ? remainingCount
                     : candidates.length;
                 const batchCandidates = candidates.filter(ip => !attemptedIps.has(ip)).slice(0, batchLimit);
 
@@ -498,7 +521,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                     if (ipSource === 'third') return replaceTargetPort(target, selectedPort);
                     return target;
                 });
-                const originalResolvedMap = prepared.resolvedMap;
+                const originalResolvedMap = resolvedMap;
                 const scanResolvedMap = originalResolvedMap
                     ? { ...originalResolvedMap }
                     : undefined;
@@ -524,7 +547,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                         onProgress,
                         () => {},
                         scanResolvedMap,
-                        targetAvailableCount,
+                        remainingCount,
                     );
                     scannerRef.current = scanner;
                     await scanner.run();
@@ -532,16 +555,23 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
 
                 if (
                     resultsFound.length >= targetAvailableCount ||
-                    scanStopRequestedRef.current ||
-                    attemptedIps.size >= maxCandidateCount
+                    scanStopRequestedRef.current
                 ) break;
 
-                const nextBatchSize = Math.min(
-                    targetAvailableCount - resultsFound.length,
-                    maxCandidateCount - attemptedIps.size,
-                );
+                const remainingCountAfterBatch = targetAvailableCount - resultsFound.length;
+                const nextBatchSize = browserScanWillRun && ipSource !== 'third'
+                    ? Math.max(remainingCountAfterBatch, targetAvailableCount * RANDOM_CANDIDATES_PER_BATCH)
+                    : remainingCountAfterBatch;
                 if (ipSource === 'third') {
-                    candidates = candidates.filter(ip => !attemptedIps.has(ip));
+                    const untestedCandidates = candidates.filter(ip => !attemptedIps.has(ip));
+                    if (untestedCandidates.length > 0) {
+                        candidates = untestedCandidates;
+                    } else {
+                        sourceExpansionRound++;
+                        const expandedSource = await prepareTargets(nextBatchSize, attemptedIps, sourceExpansionRound);
+                        candidates = expandedSource?.targets ?? [];
+                        resolvedMap = { ...resolvedMap, ...expandedSource?.resolvedMap };
+                    }
                 } else {
                     const nextBatch = await prepareTargets(nextBatchSize, attemptedIps);
                     candidates = nextBatch?.targets ?? [];
@@ -563,11 +593,9 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             if (resultsFound.length < targetAvailableCount) {
                 const reason = scanStopRequestedRef.current
                     ? '已停止'
-                    : attemptedIps.size >= maxCandidateCount && ipSource === 'third'
-                        ? '第三方源候选已全部测速'
-                        : attemptedIps.size >= maxCandidateCount
-                            ? `已达到随机候选上限 ${maxCandidateCount}`
-                        : '未找到更多未测候选 IP';
+                    : ipSource === 'third'
+                        ? '第三方源没有更多新候选 IP，请确认源支持 limit 扩展或分页'
+                        : 'IP 网段没有生成更多未测候选';
                 showToast(`${reason}，找到 ${resultsFound.length}/${targetAvailableCount} 个符合延迟限制的 IP`, 'warning');
             } else {
                 showToast(`已找到 ${targetAvailableCount} 个符合延迟限制的 IP`, 'success');

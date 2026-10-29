@@ -27,7 +27,7 @@ function parseSource(text: string): ParsedEntry[] {
     const lines = text.split(/[\r\n]+/); // 兼容各种换行符
 
     for (const line of lines) {
-        const trimmed = line.trim();
+        const trimmed = line.replace(/^\uFEFF/, '').trim();
         // 忽略空行、注释或HTML错误页
         if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('<') || trimmed.startsWith('//')) continue;
 
