@@ -233,7 +233,7 @@ export async function measureIpLatency(
         if (!hexIp) throw new Error('无效的 IPv4 地址');
 
         const testUrl = `https://${hexIp}.ns.psb.kdns.fr:${port}/ip.json?_t=${Date.now()}`;
-        const fetchWithTimeout = async (requestTimeout: number) => {
+        const fetchWithTimeout = async (method: 'OPTIONS' | 'GET', requestTimeout: number) => {
             const requestController = new AbortController();
             const abortRequest = () => requestController.abort();
             controller.signal.addEventListener('abort', abortRequest, { once: true });
@@ -247,6 +247,7 @@ export async function measureIpLatency(
 
             try {
                 const response = await fetch(testUrl, {
+                    method,
                     signal: requestController.signal,
                     cache: 'no-store',
                 });
@@ -263,16 +264,28 @@ export async function measureIpLatency(
         };
 
         if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
-        // 用 GET 预热复用连接，避免显式 OPTIONS 触发浏览器 CORS 预检。
-        const warmResponse = await fetchWithTimeout(timeout);
-        if (warmResponse.status !== 200) {
-            const error = `HTTP ${warmResponse.status}`;
-            return { latency: -1, colo: error, error };
+        // OPTIONS 预热连接，再用 GET 记录延迟。
+        let lastOptionsError: unknown;
+        let optionsSucceeded = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
+            try {
+                const optionsResponse = await fetchWithTimeout('OPTIONS', timeout * 2);
+                if (optionsResponse.status >= 200 && optionsResponse.status < 300) {
+                    optionsSucceeded = true;
+                    break;
+                }
+                lastOptionsError = new Error(`OPTIONS HTTP ${optionsResponse.status}`);
+            } catch (error) {
+                if (signal?.aborted) throw error;
+                lastOptionsError = error;
+            }
         }
+        if (!optionsSucceeded) throw lastOptionsError || new Error('OPTIONS 不可用');
 
         if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
         const requestStart = performance.now();
-        const response = await fetchWithTimeout(timeout);
+        const response = await fetchWithTimeout('GET', timeout);
         const latency = Math.max(1, Math.round(response.responseAt - requestStart));
 
         if (response.status !== 200) {
