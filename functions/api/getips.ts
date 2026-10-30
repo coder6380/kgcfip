@@ -1,3 +1,5 @@
+import { formatIpTextLine } from '../../src/utils/ipTextFormat.ts';
+
 interface Env {
     IP_KV: KVNamespace;
     APITOKEN?: string;
@@ -128,8 +130,13 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
         const formattedResults = allItems.map(item => {
             const region = item.colo ? getColoName(item.colo) : '未知';
             const alias = `${region}|${item.sceneName}`;
-            const line = `${item.ip}:${item.port}#${alias}|${item.latency}ms`;
-            return line;
+            return formatIpTextLine({
+                ip: item.ip,
+                port: item.port,
+                alias,
+                latency: item.latency,
+                downloadSpeedMBps: item.downloadSpeedMBps,
+            });
         });
         
         return new Response(formattedResults.join('\n'), {

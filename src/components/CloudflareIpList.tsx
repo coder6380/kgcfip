@@ -1,15 +1,21 @@
-import { useState, useEffect } from 'react';
-import { CloudflareIps, getCloudflareIps, syncCloudflareIps } from '../api';
-import { Cloud, RotateCw } from 'lucide-react';
+import { useEffect, useState, type FormEvent } from 'react';
+import { CloudflareIps, getCloudflareIps, saveCustomIpCidrs, syncCloudflareIps } from '../api';
+import { Cloud, RotateCw, Plus, Trash2 } from 'lucide-react';
+import { normalizeIpv4Cidr } from '../utils/ipRange';
 import { useToast } from './Toast';
 
 interface CloudflareIpListProps {
     onDataLoaded: (data: CloudflareIps) => void;
 }
 
+type RangeTab = 'cf' | 'cm' | 'custom';
+
 export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
     const [cfIps, setCfIps] = useState<CloudflareIps | null>(null);
     const [loading, setLoading] = useState(false);
+    const [customCidrInput, setCustomCidrInput] = useState('');
+    const [isSavingCustom, setIsSavingCustom] = useState(false);
+    const [activeTab, setActiveTab] = useState<RangeTab>('cf');
     const { showToast } = useToast();
 
     const loadData = async (retryCount = 3) => {
@@ -18,25 +24,18 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
             try {
                 const cfData = await getCloudflareIps();
                 setCfIps(cfData);
-                if (cfData) {
-                    onDataLoaded(cfData);
-                }
+                if (cfData) onDataLoaded(cfData);
                 setLoading(false);
-                return; // 成功则直接返回
+                return;
             } catch (err) {
                 console.error(`Failed to fetch Cloudflare IPs (attempt ${attempt}/${retryCount})`, err);
                 if (attempt < retryCount) {
-                    // 指数退避：1s, 2s, 3s
-                    const delay = attempt * 1000;
-                    await new Promise(resolve => setTimeout(resolve, delay));
+                    await new Promise(resolve => setTimeout(resolve, attempt * 1000));
                 } else {
-                    // 最后一次也失败，才提示用户
-                    showToast('获取Cloudflare IP段失败，可点击"同步最新IP段"手动重试', 'error');
+                    showToast('获取 IP 段失败，可点击同步按钮重试', 'error');
                 }
             } finally {
-                if (attempt === retryCount) {
-                    setLoading(false);
-                }
+                if (attempt === retryCount) setLoading(false);
             }
         }
     };
@@ -47,59 +46,161 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
             const data = await syncCloudflareIps();
             setCfIps(data);
             onDataLoaded(data);
-            showToast('同步成功', 'success');
+            showToast('IP 段同步完成', 'success');
         } catch (err) {
-            showToast('同步Cloudflare IP失败', 'error');
+            showToast('同步 IP 段失败', 'error');
         } finally {
             setLoading(false);
         }
     };
 
+    const persistCustomCidrs = async (nextCidrs: string[]) => {
+        setIsSavingCustom(true);
+        try {
+            const data = await saveCustomIpCidrs(nextCidrs);
+            setCfIps(data);
+            onDataLoaded(data);
+            return true;
+        } catch (error) {
+            console.error('Failed to save custom IP ranges:', error);
+            showToast('保存自定义 IP 段失败', 'error');
+            return false;
+        } finally {
+            setIsSavingCustom(false);
+        }
+    };
+
+    const handleAddCustomCidr = async (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const cidr = normalizeIpv4Cidr(customCidrInput);
+        if (!cidr) {
+            showToast('请输入有效 IPv4 地址或 CIDR，例如 203.0.113.0/24', 'warning');
+            return;
+        }
+
+        const customCidrs = cfIps?.custom_ipv4_cidrs || [];
+        if (customCidrs.includes(cidr)) {
+            showToast('该 IP 段已经添加', 'warning');
+            return;
+        }
+        if (await persistCustomCidrs([...customCidrs, cidr])) setCustomCidrInput('');
+    };
+
+    const handleDeleteCustomCidr = async (cidr: string) => {
+        const customCidrs = cfIps?.custom_ipv4_cidrs || [];
+        await persistCustomCidrs(customCidrs.filter(item => item !== cidr));
+    };
+
     useEffect(() => {
-        loadData();
+        void loadData();
     }, []);
 
-    return (
-        <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg p-6 mb-8">
-            <div className="flex items-center gap-4 mb-6">
-                <Cloud className="w-7 h-7 text-blue-500" />
-                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP段</h2>
-                <button 
-                    onClick={handleSync}
-                    disabled={loading}
-                    className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-blue-600 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900/50 dark:text-blue-300 dark:hover:bg-blue-800/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="从上游同步最新的IP段"
-                >
-                    <RotateCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-                    <span>{loading ? '同步中...' : '同步最新IP段'}</span>
-                </button>
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div>
-                  <div className="flex items-center gap-2 mb-3">
-                    <h3 className="font-bold text-gray-600 dark:text-gray-300">CF官方IP段</h3>
-                    <span className="text-xs text-gray-400 dark:text-gray-500">cloudflare官方公布的ip段，覆盖最全</span>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {cfIps?.ipv4_cidrs && cfIps.ipv4_cidrs.length > 0 ? cfIps.ipv4_cidrs.map(cidr => (
-                      <span key={cidr} className="bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-2 py-1 rounded text-xs font-mono">{cidr}</span>
-                    )) : <p className="text-gray-400 text-xs italic">暂无数据</p>}
-                  </div>
-                </div>
+    const customCidrs = cfIps?.custom_ipv4_cidrs || [];
+    const tabItems: { id: RangeTab; label: string; count: number }[] = [
+        { id: 'cf', label: 'CF 官方', count: cfIps?.ipv4_cidrs?.length || 0 },
+        { id: 'cm', label: 'CM 整理', count: cfIps?.cm_cidrs?.length || 0 },
+        { id: 'custom', label: '自定义', count: customCidrs.length },
+    ];
+    const visibleCidrs = activeTab === 'cf'
+        ? cfIps?.ipv4_cidrs || []
+        : activeTab === 'cm'
+            ? cfIps?.cm_cidrs || []
+            : customCidrs;
 
-                <div>
-                  <div className="flex items-center gap-2 mb-3">
-                    <h3 className="font-bold text-gray-600 dark:text-gray-300">CM整理IP段</h3>
-                    <span className="text-xs text-gray-400 dark:text-gray-500">民间大佬维护IP段，测速成功率高</span>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {cfIps?.cm_cidrs && cfIps.cm_cidrs.length > 0 ? cfIps.cm_cidrs.map(cidr => (
-                      <span key={cidr} className="bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-2 py-1 rounded text-xs font-mono">{cidr}</span>
-                    )) : <p className="text-gray-400 text-xs italic">暂无数据</p>}
-                  </div>
+    return (
+        <section className="mb-6 rounded-lg border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-700 dark:bg-gray-800 sm:p-6">
+            <header className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex min-w-0 items-center gap-3">
+                    <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md bg-sky-50 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+                        <Cloud className="h-5 w-5" />
+                    </span>
+                    <div>
+                        <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-100">IP 段</h2>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">管理测速使用的 IPv4 网段</p>
+                    </div>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => void handleSync()}
+                    disabled={loading || isSavingCustom}
+                    className="inline-flex h-9 items-center gap-2 rounded-md border border-gray-300 px-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+                    title="同步 CF 官方和 CM 整理网段"
+                >
+                    <RotateCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+                    {loading ? '同步中' : '同步网段'}
+                </button>
+            </header>
+
+            <div className="mt-5 border-b border-gray-200 dark:border-gray-700">
+                <div className="flex gap-5 overflow-x-auto" role="tablist" aria-label="IP 段来源">
+                    {tabItems.map(tab => (
+                        <button
+                            key={tab.id}
+                            type="button"
+                            role="tab"
+                            aria-selected={activeTab === tab.id}
+                            onClick={() => setActiveTab(tab.id)}
+                            className={`-mb-px flex-none border-b-2 px-1 pb-2.5 text-sm transition-colors ${activeTab === tab.id
+                                ? 'border-sky-600 font-semibold text-sky-700 dark:border-sky-400 dark:text-sky-300'
+                                : 'border-transparent text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-100'
+                                }`}
+                        >
+                            {tab.label}<span className="ml-2 text-xs tabular-nums text-gray-400">{tab.count}</span>
+                        </button>
+                    ))}
                 </div>
             </div>
-        </div>
+
+            <div className="pt-4" role="tabpanel">
+                {activeTab === 'custom' && (
+                    <form onSubmit={handleAddCustomCidr} className="mb-4 flex flex-col gap-2 sm:flex-row">
+                        <label htmlFor="custom-ip-cidr" className="sr-only">自定义 IPv4 或 CIDR</label>
+                        <input
+                            id="custom-ip-cidr"
+                            type="text"
+                            value={customCidrInput}
+                            onChange={event => setCustomCidrInput(event.target.value)}
+                            placeholder="203.0.113.0/24 或 203.0.113.10"
+                            disabled={loading || isSavingCustom}
+                            className="h-10 min-w-0 flex-1 rounded-md border border-gray-300 bg-white px-3 font-mono text-sm text-gray-800 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
+                        />
+                        <button
+                            type="submit"
+                            disabled={loading || isSavingCustom || !customCidrInput.trim()}
+                            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-sky-700 px-4 text-sm font-semibold text-white transition-colors hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+                        >
+                            <Plus className="h-4 w-4" />
+                            添加网段
+                        </button>
+                    </form>
+                )}
+
+                {visibleCidrs.length > 0 ? (
+                    <ul className="max-h-52 divide-y divide-gray-100 overflow-y-auto pr-1 dark:divide-gray-700">
+                        {visibleCidrs.map(cidr => (
+                            <li key={cidr} className="flex min-h-10 items-center justify-between gap-3 py-1.5">
+                                <code className="min-w-0 break-all text-sm text-gray-700 dark:text-gray-200">{cidr}</code>
+                                {activeTab === 'custom' && (
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleDeleteCustomCidr(cidr)}
+                                        disabled={loading || isSavingCustom}
+                                        aria-label={`删除 ${cidr}`}
+                                        title={`删除 ${cidr}`}
+                                        className="flex h-8 w-8 flex-none items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-red-50 hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-900/30 dark:hover:text-red-300"
+                                    >
+                                        <Trash2 className="h-4 w-4" />
+                                    </button>
+                                )}
+                            </li>
+                        ))}
+                    </ul>
+                ) : (
+                    <p className="py-5 text-center text-sm text-gray-500 dark:text-gray-400">
+                        {activeTab === 'custom' ? '还没有自定义网段' : loading ? '正在加载网段…' : '暂无网段数据'}
+                    </p>
+                )}
+            </div>
+        </section>
     );
 }

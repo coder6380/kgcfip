@@ -6,6 +6,7 @@ import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog'; // Import Trash2 and RotateCw
 import { Gauge, ListChecks, Trash2, RotateCw, FileText, File, Copy, StopCircle } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
+import { formatIpTextLine } from '../utils/ipTextFormat';
 
 // Type for data stored in KV, which does not include `isAvailable`
 interface SavedIpData {
@@ -463,9 +464,13 @@ export function SavedIpList() {
             for (const item of filteredItemsSorted) {
                 const regionName = getColoName(item.colo || '');
                 const sceneName = item.sceneName;
-                const latency = `${item.latency}ms`;
-                const comment = `${regionName}|${sceneName}|${latency}`;
-                txtContent += `${item.ip}:${item.port}#${comment}\n`;
+                txtContent += `${formatIpTextLine({
+                    ip: item.ip,
+                    port: item.port,
+                    alias: `${regionName}|${sceneName}`,
+                    latency: item.latency,
+                    downloadSpeedMBps: item.downloadSpeedMBps,
+                })}\n`;
             }
 
             // Create a new file with the TXT data.
@@ -494,9 +499,13 @@ export function SavedIpList() {
         for (const item of filteredItemsSorted) {
             const regionName = getColoName(item.colo || '').replace(/^(\p{Regional_Indicator}+)\s+/u, '$1');
             const sceneName = item.sceneName;
-            const latency = `${item.latency}ms`;
-            const comment = `${regionName}|${sceneName}|${latency}`;
-            txtContent += `${item.ip}:${item.port}#${comment}\n`;
+            txtContent += `${formatIpTextLine({
+                ip: item.ip,
+                port: item.port,
+                alias: `${regionName}|${sceneName}`,
+                latency: item.latency,
+                downloadSpeedMBps: item.downloadSpeedMBps,
+            })}\n`;
         }
 
         navigator.clipboard.writeText(txtContent).then(() => {

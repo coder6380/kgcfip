@@ -20,13 +20,16 @@ import {
     resolveDomainToIp,
     probeBrowserAvailable,
 } from '../utils/scanner';
+import { coloCountryMap, coloMap, getColoText } from '../utils/colo';
+import { isColoSelectable, isRegionCountrySelectable, isRegionQualifiedResult, matchesSelectedColo } from '../utils/regionFilter';
+import { assignScanPort, parseThirdPartySource, type ScannerIpSource } from '../utils/scannerTarget';
 import {
     probeLocalAgent, startAgentScan, fetchAgentProgress, stopAgentScan,
     DEFAULT_AGENT_PORT,
     type AgentResult, type AgentProbeResult,
 } from '../utils/localAgent';
 import { useToast } from './Toast';
-import { Gauge, Play, StopCircle, Loader2, Pause, Square, Cpu, RefreshCw, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Gauge, Play, StopCircle, Loader2, Pause, Square, Cpu, RefreshCw, AlertTriangle, CheckCircle2, ChevronDown, MapPin, Plus, Search } from 'lucide-react';
 import { useConfirm } from './ConfirmDialog';
 
 interface IpScannerConfigAndControlProps {
@@ -35,8 +38,37 @@ interface IpScannerConfigAndControlProps {
     onScanProgress: (results: ScanResult[]) => void;
 }
 
-const PORTS_TO_TEST = [80, 443, 8080, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8443];
+const CLOUDFLARE_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 const RANDOM_CANDIDATES_PER_BATCH = 20;
+const countryDisplayNames = (() => {
+    const intlWithDisplayNames = Intl as typeof Intl & {
+        DisplayNames?: new (locales: string[], options: { type: 'region' }) => { of: (code: string) => string | undefined };
+    };
+    return intlWithDisplayNames.DisplayNames
+        ? new intlWithDisplayNames.DisplayNames(['zh-CN'], { type: 'region' })
+        : null;
+})();
+
+const getCountryLabel = (countryCode: string) => countryCode === 'other'
+    ? '其他'
+    : countryDisplayNames?.of(countryCode.toUpperCase()) ?? countryCode.toUpperCase();
+
+const REGION_GROUPS = (() => {
+    const groups = new Map<string, string[]>();
+    Object.keys(coloMap).forEach(colo => {
+        const countryCode = coloCountryMap[colo] ?? 'other';
+        if (!isRegionCountrySelectable(countryCode)) return;
+        const group = groups.get(countryCode) ?? [];
+        group.push(colo);
+        groups.set(countryCode, group);
+    });
+
+    return Array.from(groups, ([countryCode, colos]) => ({
+        countryCode,
+        name: getCountryLabel(countryCode),
+        colos: colos.sort(),
+    })).sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'));
+})();
 
 const getSourceUrlForExpansionRound = (sourceUrl: string, round: number) => {
     if (round <= 0) return sourceUrl;
@@ -55,35 +87,25 @@ const getSourceUrlForExpansionRound = (sourceUrl: string, round: number) => {
     }
 };
 
-const replaceTargetPort = (target: string, port: number) => {
-    const lastColonIndex = target.lastIndexOf(':');
-    const closeBracketIndex = target.lastIndexOf(']');
-    let host = target;
-
-    if (lastColonIndex > closeBracketIndex) {
-        const currentPort = Number.parseInt(target.substring(lastColonIndex + 1), 10);
-        if (!Number.isNaN(currentPort)) host = target.substring(0, lastColonIndex);
-    }
-
-    if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) {
-        host = `[${host}]`;
-    }
-    return `${host}:${port}`;
-};
-
 export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScannerConfigAndControlProps) {
     const [count, setCount] = useState<string>('50');
     const [threads, setThreads] = useState<string>('16');
     const [latencyLimit, setLatencyLimit] = useState<string>('1000');
-/*  */    const [countError, setCountError] = useState<string>('');
+    const [countError, setCountError] = useState<string>('');
     const [threadsError, setThreadsError] = useState<string>('');
     const [latencyLimitError, setLatencyLimitError] = useState<string>('');
     const [selectedPort, setSelectedPort] = useState<number | 'random'>('random');
-    const [ipSource, setIpSource] = useState<'cf' | 'cm' | 'third'>('cf');
+    const [ipSource, setIpSource] = useState<ScannerIpSource>('cf');
+    const [selectedColos, setSelectedColos] = useState<Set<string>>(new Set());
+    const [activeScanColos, setActiveScanColos] = useState<Set<string>>(new Set());
+    const [isRegionPickerOpen, setIsRegionPickerOpen] = useState(false);
+    const [regionSearch, setRegionSearch] = useState('');
+    const [customColo, setCustomColo] = useState('');
     const [isScanning, setIsScanning] = useState(false);
     const [progress, setProgress] = useState(0);
     const [total, setTotal] = useState(0);
     const [successCount, setSuccessCount] = useState(0);
+    const [regionMismatchCount, setRegionMismatchCount] = useState(0);
     const [failCount, setFailCount] = useState(0);
     const [isStopping, setIsStopping] = useState(false);
     const [uniqueIpCount, setUniqueIpCount] = useState(0);
@@ -98,6 +120,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
     const [now, setNow] = useState(Date.now());
     const [isPaused, setIsPaused] = useState(false);
     const [pausedAt, setPausedAt] = useState<number | null>(null);
+    const regionPickerRef = useRef<HTMLDivElement>(null);
 
     const scannerRef = useRef<BatchScanner | null>(null);
     const cancelPreparingRef = useRef(false);
@@ -150,8 +173,11 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
         setBrowserHealthy(null);
         try {
             // 从同步到的 Cloudflare IP 段中随机取样例 IP（10 个）用于自检，避免依赖写死地址
-            const cidrs = cfIps?.ipv4_cidrs?.length ? cfIps.ipv4_cidrs
-                : (cfIps?.cm_cidrs?.length ? cfIps.cm_cidrs : []);
+            const cidrs = ipSource === 'custom'
+                ? cfIps?.custom_ipv4_cidrs || []
+                : ipSource === 'cm'
+                    ? cfIps?.cm_cidrs || []
+                    : cfIps?.ipv4_cidrs || [];
             const sampleIps = cidrs.length > 0 ? generateRandomIps(cidrs, 10) : undefined;
             const ok = await probeBrowserAvailable(sampleIps);
             setBrowserHealthy(ok);
@@ -160,12 +186,73 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
         } finally {
             setBrowserChecking(false);
         }
-    }, [cfIps]);
+    }, [cfIps, ipSource]);
 
     // 进入「浏览器测速」Tab 时做一次自检
     useEffect(() => {
         if (activeTab === 'browser') void checkBrowser();
     }, [activeTab, checkBrowser]);
+
+    useEffect(() => {
+        if (!isRegionPickerOpen) return;
+        const handlePointerDown = (event: MouseEvent) => {
+            if (regionPickerRef.current && !regionPickerRef.current.contains(event.target as Node)) {
+                setIsRegionPickerOpen(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') setIsRegionPickerOpen(false);
+        };
+        document.addEventListener('mousedown', handlePointerDown);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('mousedown', handlePointerDown);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [isRegionPickerOpen]);
+
+    const normalizedRegionSearch = regionSearch.trim().toLocaleLowerCase();
+    const visibleRegionGroups = REGION_GROUPS.map(group => {
+        const groupMatches = `${group.name} ${group.countryCode}`.toLocaleLowerCase().includes(normalizedRegionSearch);
+        const visibleColos = group.colos.filter(colo => groupMatches
+            || `${colo} ${getColoText(colo)}`.toLocaleLowerCase().includes(normalizedRegionSearch));
+        return { ...group, visibleColos };
+    }).filter(group => group.visibleColos.length > 0);
+
+    const selectedColoList = Array.from(selectedColos).sort();
+    const selectedRegionLabel = selectedColos.size === 0
+        ? '不限地区'
+        : selectedColoList.length <= 3
+            ? selectedColoList.map(colo => {
+                const name = getColoText(colo);
+                return name === colo ? colo : `${colo} ${name}`;
+            }).join('、')
+            : `${selectedColos.size} 个机房`;
+
+    const toggleCountry = (colos: string[]) => {
+        setSelectedColos(previous => {
+            const next = new Set(previous);
+            const shouldSelect = !colos.every(colo => next.has(colo));
+            colos.forEach(colo => shouldSelect ? next.add(colo) : next.delete(colo));
+            return next;
+        });
+    };
+
+    const toggleColo = (colo: string) => {
+        setSelectedColos(previous => {
+            const next = new Set(previous);
+            if (next.has(colo)) next.delete(colo);
+            else next.add(colo);
+            return next;
+        });
+    };
+
+    const addCustomColo = () => {
+        const colo = customColo.trim().toUpperCase();
+        if (!/^[A-Z0-9]{3}$/.test(colo) || !isColoSelectable(colo)) return;
+        setSelectedColos(previous => new Set([...previous, colo]));
+        setCustomColo('');
+    };
 
     const showLocationWarning = async () => {
         const result = await confirm('检测到您目前网络处于代理或VPN环境，请处于直连状态下再开始测试，否则结果没有意义！', {
@@ -255,31 +342,47 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                 .filter(source => source !== '' && !source.startsWith('#'));
             if (sources.length === 0) return null;
 
-            const requestSources = sources.map(url => getSourceUrlForExpansionRound(url, sourceExpansionRound));
-            const rows: SourceRow[] = requestSources.map((url) => ({ url, status: 'pending' }));
+            const parsedSources = sources.map(source => ({ source, parsed: parseThirdPartySource(source) }));
+            const urlSources = parsedSources.flatMap(({ parsed }, sourceIndex) => parsed.kind === 'url'
+                ? [{ sourceIndex, url: getSourceUrlForExpansionRound(parsed.url, sourceExpansionRound) }]
+                : []);
+            const directTargets = parsedSources.flatMap(({ parsed }) => parsed.kind === 'target'
+                ? [{ ip: parsed.ip, port: parsed.port }]
+                : []);
+            const rows: SourceRow[] = parsedSources.map(({ source, parsed }) => {
+                if (parsed.kind === 'url') {
+                    return { url: getSourceUrlForExpansionRound(parsed.url, sourceExpansionRound), status: 'pending' };
+                }
+                if (parsed.kind === 'target') {
+                    return { url: source, status: 'done', ipCount: 1, domainCount: 0, ips: [{ ip: parsed.ip, port: parsed.port }] };
+                }
+                return { url: source, status: 'error', error: '格式无效' };
+            });
             setSourceRows(rows);
-            setPrepareTotal(requestSources.length);
+            setPrepareTotal(urlSources.length);
 
-            // 逐源解析，实时更新对应条目的状态与结果
+            // 直接目标绕过源抓取 API；只有 URL 源需要后端拉取 IP 集合。
             const allIps = new Map<string, { ip: string; port: number }>();
+            directTargets.forEach(item => allIps.set(`${item.ip}:${item.port}`, item));
             let grossCount = 0;
             let doneCount = 0;
 
-            for (let i = 0; i < requestSources.length; i++) {
+            for (let i = 0; i < urlSources.length; i++) {
                 if (cancelPreparingRef.current) return null;
                 // 标记当前行为"解析中"
-                setSourceRows((prev) => prev.map((r, idx) => idx === i ? { ...r, status: 'loading' } : r));
+                const { sourceIndex, url } = urlSources[i];
+                setSourceRows((prev) => prev.map((r, idx) => idx === sourceIndex ? { ...r, status: 'loading' } : r));
                 setPrepareDone(i);
 
                 let stat;
                 try {
-                    stat = await getThirdPartySourceIps(requestSources[i]);
+                    stat = await getThirdPartySourceIps(url);
                 } catch (e) {
-                    stat = { url: requestSources[i], status: 'error', count: 0, ipCount: 0, domainCount: 0, ips: [], error: (e as Error).message };
+                    stat = { url, status: 'error', count: 0, ipCount: 0, domainCount: 0, ips: [], error: (e as Error).message };
                 }
 
                 // 更新当前行结果
-                setSourceRows((prev) => prev.map((r, idx) => idx === i ? {
+                setSourceRows((prev) => prev.map((r, idx) => idx === sourceIndex ? {
                     url: stat.url,
                     status: stat.status === 'error' ? 'error' : 'done',
                     ipCount: stat.ipCount,
@@ -309,7 +412,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             }
 
             setUniqueIpCount(finalIps.length);
-            setGrossIpCount(grossCount);
+            setGrossIpCount(grossCount + directTargets.length);
             setIpCount(dedupIp);
             setDomainCount(dedupDomain);
 
@@ -341,10 +444,14 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
 
         const cidrsToUse = ipSource === 'cf'
             ? (cfIps?.ipv4_cidrs?.length ? cfIps.ipv4_cidrs : (CF_CIDR_LIST || []))
-            : (cfIps?.cm_cidrs?.length ? cfIps.cm_cidrs : (CF_CIDR_LIST || []));
+            : ipSource === 'cm'
+                ? (cfIps?.cm_cidrs?.length ? cfIps.cm_cidrs : (CF_CIDR_LIST || []))
+                : (cfIps?.custom_ipv4_cidrs || []);
 
         if (!cidrsToUse || cidrsToUse.length === 0) {
-            showToast('未找到Cloudflare IP段数据，请先点击上方的"同步IP段"按钮进行同步。', 'error');
+            showToast(ipSource === 'custom'
+                ? '还没有自定义 IP 段，请先到上方 IP 段中添加。'
+                : '未找到Cloudflare IP段数据，请先点击上方的"同步IP段"按钮进行同步。', 'error');
             return null;
         }
         return { targets: generateRandomIps(cidrsToUse, countNum, excludedIps) };
@@ -468,6 +575,8 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
 
             const scanPort = selectedPort === 'random' ? 0 : selectedPort;
             const targetAvailableCount = val.countNum;
+            const scanColos = new Set(selectedColos);
+            setActiveScanColos(scanColos);
             const attemptedIps = new Set<string>();
             let candidates = prepared.targets;
             let resolvedMap = prepared.resolvedMap;
@@ -476,6 +585,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             onScanComplete([]);
             setProgress(0);
             setSuccessCount(0);
+            setRegionMismatchCount(0);
             setFailCount(0);
             setTotal(0);
             setIsPreparing(false);
@@ -492,11 +602,13 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
             const onProgress = (result: ScanResult) => {
                 scanAttemptCount++;
                 setProgress(scanAttemptCount);
-                if (result.isAvailable) {
+                if (isRegionQualifiedResult(result, scanColos)) {
                     setSuccessCount(success => success + 1);
                     resultsFound.push(result);
                     resultsFound.sort((a, b) => a.latency - b.latency);
                     onScanProgress([...resultsFound]);
+                } else if (result.isAvailable) {
+                    setRegionMismatchCount(count => count + 1);
                 } else {
                     setFailCount(failures => failures + 1);
                 }
@@ -513,13 +625,8 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                 batchCandidates.forEach(ip => attemptedIps.add(ip));
 
                 const scanTargets = batchCandidates.map(target => {
-                    if (selectedPort === 'random') {
-                        const randomPort = PORTS_TO_TEST[Math.floor(Math.random() * PORTS_TO_TEST.length)];
-                        if (ipSource === 'third') return replaceTargetPort(target, randomPort);
-                        return `${target}:${randomPort}`;
-                    }
-                    if (ipSource === 'third') return replaceTargetPort(target, selectedPort);
-                    return target;
+                    const randomPort = CLOUDFLARE_HTTPS_PORTS[Math.floor(Math.random() * CLOUDFLARE_HTTPS_PORTS.length)];
+                    return assignScanPort(target, ipSource, selectedPort, randomPort);
                 });
                 const originalResolvedMap = resolvedMap;
                 const scanResolvedMap = originalResolvedMap
@@ -548,6 +655,7 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                         () => {},
                         scanResolvedMap,
                         remainingCount,
+                        result => matchesSelectedColo(result.colo, scanColos),
                     );
                     scannerRef.current = scanner;
                     await scanner.run();
@@ -596,9 +704,9 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                     : ipSource === 'third'
                         ? '第三方源没有更多新候选 IP，请确认源支持 limit 扩展或分页'
                         : 'IP 网段没有生成更多未测候选';
-                showToast(`${reason}，找到 ${resultsFound.length}/${targetAvailableCount} 个符合延迟限制的 IP`, 'warning');
+                showToast(`${reason}，找到 ${resultsFound.length}/${targetAvailableCount} 个符合筛选条件的 IP`, 'warning');
             } else {
-                showToast(`已找到 ${targetAvailableCount} 个符合延迟限制的 IP`, 'success');
+                showToast(`已找到 ${targetAvailableCount} 个符合筛选条件的 IP`, 'success');
             }
         } catch (error) {
             console.error('Scan failed:', error);
@@ -663,18 +771,19 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                 <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP优选测速</h2>
             </div>
             
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4 mb-4">
+            <div className="grid grid-cols-1 gap-4 mb-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
                 <div>
                     <label htmlFor="ip-source" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">IP来源:</label>
                     <select
                         id="ip-source"
                         value={ipSource}
-                        onChange={(e) => setIpSource(e.target.value as 'cf' | 'cm' | 'third')}
+                        onChange={(e) => setIpSource(e.target.value as ScannerIpSource)}
                         className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     >
                         <option value="cf">CF官方IP</option>
                         <option value="cm">CM整理IP</option>
+                        <option value="custom">自定义IP段</option>
                         <option value="third">第三方IP/域名源</option>
                     </select>
                 </div>
@@ -692,12 +801,18 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                 </div>
                 <div>
                     <label htmlFor="port-select" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">端口:</label>
-                    <select id="port-select" value={selectedPort} onChange={(e) => setSelectedPort(e.target.value === 'random' ? 'random' : Number(e.target.value))} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing}>
-                        <option value="random">随机</option>
-                        {PORTS_TO_TEST.map(port => (
-                            <option key={port} value={port}>{port}</option>
-                        ))}
-                    </select>
+                    {ipSource === 'third' ? (
+                        <div className="flex h-10 items-center rounded border border-gray-200 bg-gray-50 px-3 text-sm text-gray-600 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300">
+                            使用源内端口，缺省 443
+                        </div>
+                    ) : (
+                        <select id="port-select" value={selectedPort} onChange={(e) => setSelectedPort(e.target.value === 'random' ? 'random' : Number(e.target.value))} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing}>
+                            <option value="random">随机</option>
+                            {CLOUDFLARE_HTTPS_PORTS.map(port => (
+                                <option key={port} value={port}>{port}</option>
+                            ))}
+                        </select>
+                    )}
                 </div>
                 <div>
                     <label htmlFor="threads-count" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">线程数:</label>
@@ -735,33 +850,159 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                 </div>
             </div>
 
-            {/* ============ 测速方式：浏览器测速 / 本地测速 ============ */}
-            <div className="mb-4">
-                <div className="flex w-fit items-center rounded-lg bg-gray-100 p-1 dark:bg-gray-700 mb-3">
+            <div className="mb-4 grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+                <div>
+                <label id="scan-region-label" className="mb-1 block text-sm font-semibold text-gray-700 dark:text-gray-300">扫描地区:</label>
+                <div className="relative" ref={regionPickerRef}>
                     <button
+                        type="button"
+                        aria-labelledby="scan-region-label"
+                        aria-expanded={isRegionPickerOpen}
+                        aria-controls="scan-region-picker"
+                        onClick={() => setIsRegionPickerOpen(open => !open)}
+                        disabled={isScanning || isPreparing}
+                        className="flex h-10 w-full items-center gap-2 rounded-md border border-gray-300 bg-white px-3 text-left text-sm text-gray-700 transition-colors hover:border-gray-400 focus:outline-none focus:ring-2 focus:ring-sky-500/30 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
+                    >
+                        <MapPin className="h-4 w-4 flex-none text-purple-600 dark:text-purple-300" />
+                        <span className="min-w-0 flex-1 truncate">{selectedRegionLabel}</span>
+                        {selectedColos.size > 0 && <span className="flex-none text-xs text-gray-500 dark:text-gray-400">{selectedColos.size} 个机房</span>}
+                        <ChevronDown className={`h-4 w-4 flex-none text-gray-400 transition-transform ${isRegionPickerOpen ? 'rotate-180' : ''}`} />
+                    </button>
+
+                    {isRegionPickerOpen && (
+                        <div
+                            id="scan-region-picker"
+                            aria-label="地区筛选选项"
+                            className="absolute left-0 z-40 mt-1 w-full max-w-[calc(100vw-3rem)] overflow-hidden rounded-lg border border-gray-200 bg-white shadow-xl dark:border-gray-600 dark:bg-gray-800 sm:w-[42rem]"
+                        >
+                            <div className="space-y-3 border-b border-gray-200 p-3 dark:border-gray-700">
+                                <div className="relative">
+                                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                                    <input
+                                        type="search"
+                                        aria-label="搜索国家、机房名称或代码"
+                                        value={regionSearch}
+                                        onChange={event => setRegionSearch(event.target.value)}
+                                        placeholder="搜索国家、机房名称或代码"
+                                        className="w-full rounded border border-gray-300 bg-white py-2 pl-9 pr-3 text-sm text-gray-800 outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/30 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
+                                    />
+                                </div>
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                                    <button
+                                        type="button"
+                                        onClick={() => setSelectedColos(new Set())}
+                                        disabled={selectedColos.size === 0}
+                                        className="rounded px-2.5 py-1.5 font-medium text-purple-700 hover:bg-purple-50 disabled:cursor-not-allowed disabled:text-gray-400 dark:text-purple-300 dark:hover:bg-purple-900/30 dark:disabled:text-gray-500"
+                                    >
+                                        不限地区
+                                    </button>
+                                    <span className="text-xs text-gray-500 dark:text-gray-400">已选 {selectedColos.size} 个机房</span>
+                                </div>
+                            </div>
+
+                            <div className="max-h-64 overflow-y-auto p-3">
+                                {visibleRegionGroups.length > 0 ? (
+                                    <div className="space-y-3">
+                                        {visibleRegionGroups.map(group => {
+                                            const allSelected = group.colos.every(colo => selectedColos.has(colo));
+                                            const someSelected = group.colos.some(colo => selectedColos.has(colo));
+                                            return (
+                                                <section key={group.countryCode} className="border-b border-gray-100 pb-3 last:border-0 last:pb-0 dark:border-gray-700">
+                                                    <label className="mb-2 flex cursor-pointer items-center gap-2 text-sm font-semibold text-gray-800 dark:text-gray-100">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={allSelected}
+                                                            ref={element => { if (element) element.indeterminate = someSelected && !allSelected; }}
+                                                            onChange={() => toggleCountry(group.colos)}
+                                                            className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                                                        />
+                                                        <span>{group.name}</span>
+                                                        <span className="font-normal text-gray-400">{group.colos.length}</span>
+                                                    </label>
+                                                    <div className="grid grid-cols-1 gap-x-4 gap-y-1 pl-6 sm:grid-cols-2">
+                                                        {group.visibleColos.map(colo => (
+                                                            <label key={colo} className="flex min-w-0 cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-gray-600 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-700/70">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={selectedColos.has(colo)}
+                                                                    onChange={() => toggleColo(colo)}
+                                                                    className="h-4 w-4 flex-none rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                                                                />
+                                                                <span className="min-w-0 truncate">{getColoText(colo)}</span>
+                                                                <code className="ml-auto flex-none text-xs text-gray-400">{colo}</code>
+                                                            </label>
+                                                        ))}
+                                                    </div>
+                                                </section>
+                                            );
+                                        })}
+                                    </div>
+                                ) : (
+                                    <p className="py-6 text-center text-sm text-gray-500 dark:text-gray-400">没有匹配的地区</p>
+                                )}
+                            </div>
+
+                            <div className="flex flex-wrap items-end gap-2 border-t border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/30">
+                                <label className="min-w-36 flex-1 text-xs font-medium text-gray-600 dark:text-gray-300">
+                                    添加机房代码
+                                    <input
+                                        type="text"
+                                        value={customColo}
+                                        onChange={event => setCustomColo(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3))}
+                                        onKeyDown={event => { if (event.key === 'Enter') addCustomColo(); }}
+                                        placeholder="例如 NRT"
+                                        className="mt-1 block w-full rounded border border-gray-300 bg-white px-2.5 py-2 font-mono text-sm text-gray-800 outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/30 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
+                                    />
+                                </label>
+                                <button
+                                    type="button"
+                                    onClick={addCustomColo}
+                                    disabled={!/^[A-Z0-9]{3}$/.test(customColo) || !isColoSelectable(customColo)}
+                                    className="inline-flex h-9 items-center gap-1 rounded border border-gray-300 bg-white px-3 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600"
+                                >
+                                    <Plus className="h-4 w-4" />
+                                    添加
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setIsRegionPickerOpen(false)}
+                                    className="h-9 rounded bg-purple-600 px-4 text-sm font-medium text-white hover:bg-purple-700"
+                                >
+                                    完成
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+                </div>
+                <div className="flex w-fit max-w-full items-center rounded-md border border-gray-200 bg-gray-100 p-1 dark:border-gray-700 dark:bg-gray-700" role="group" aria-label="测速方式">
+                    <button
+                        type="button"
                         onClick={() => setActiveTab('browser')}
                         disabled={isScanning || isPreparing}
-                        className={`relative z-10 rounded-md px-4 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${
-                            activeTab === 'browser'
-                                ? 'bg-white text-gray-800 shadow-sm dark:bg-gray-900 dark:text-white'
-                                : 'text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-white'
-                        }`}
+                        className={`rounded px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed ${activeTab === 'browser'
+                            ? 'bg-white text-gray-900 shadow-sm dark:bg-gray-900 dark:text-white'
+                            : 'text-gray-600 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white'
+                            }`}
                     >
                         浏览器测速
                     </button>
                     <button
+                        type="button"
                         onClick={() => setActiveTab('local')}
                         disabled={isScanning || isPreparing}
-                        className={`relative z-10 rounded-md px-4 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${
-                            activeTab === 'local'
-                                ? 'bg-white text-gray-800 shadow-sm dark:bg-gray-900 dark:text-white'
-                                : 'text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-white'
-                        }`}
+                        className={`rounded px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed ${activeTab === 'local'
+                            ? 'bg-white text-gray-900 shadow-sm dark:bg-gray-900 dark:text-white'
+                            : 'text-gray-600 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white'
+                            }`}
                     >
                         本地测速
                     </button>
                 </div>
+            </div>
 
+            {/* ============ 测速方式：浏览器测速 / 本地测速 ============ */}
+            <div className="mb-4">
                 {activeTab === 'browser' ? (
                     /* ---------- 浏览器测速面板 ---------- */
                     <div className="space-y-3">
@@ -973,8 +1214,11 @@ export function ScannerConfig({ cfIps, onScanComplete, onScanProgress }: IpScann
                         >
                             <div className="h-full rounded-full bg-green-500 transition-all duration-300" style={{ width: `${percent}%` }} />
                         </div>
-                        <div className="mt-2 grid grid-cols-3 gap-2 text-xs sm:text-sm">
+                        <div className={`mt-2 grid gap-2 text-xs sm:text-sm ${activeScanColos.size > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'}`}>
                             <span className="text-green-700 dark:text-green-400">成功 {successCount}</span>
+                            {activeScanColos.size > 0 && (
+                                <span className="text-center text-amber-700 dark:text-amber-400">地区不符 {regionMismatchCount}</span>
+                            )}
                             <span className="text-center text-gray-600 dark:text-gray-400">已用 {fmt(elapsedSec)}</span>
                             <span className="text-right text-red-700 dark:text-red-400">失败 {failCount}</span>
                         </div>

@@ -80,7 +80,7 @@ export const coloCountryMap: { [key: string]: string } = {
     'JAX': 'us', 'RIC': 'us', 'BUF': 'us', 'PIT': 'us', 'CLE': 'us',
     'CVG': 'us', 'MKE': 'us', 'STL': 'us', 'SAT': 'us', 'HNL': 'us',
     'ANC': 'us', 'SMF': 'us', 'ONT': 'ca', 'OAK': 'us',
-    'HKG': 'hk', 'TPE': 'cn', 'TSA': 'cn', 'KHH': 'cn',
+    'HKG': 'cn', 'TPE': 'cn', 'TSA': 'cn', 'KHH': 'cn',
     'NRT': 'jp', 'HND': 'jp', 'KIX': 'jp', 'ITM': 'jp', 'NGO': 'jp',
     'FUK': 'jp', 'CTS': 'jp', 'OKA': 'jp',
     'ICN': 'kr', 'GMP': 'kr', 'PUS': 'kr',

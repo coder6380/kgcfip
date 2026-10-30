@@ -1,3 +1,5 @@
+import { normalizeIpv4Cidr } from '../../src/utils/ipRange.ts';
+
 interface Env {
     IP_KV: KVNamespace;
 }
@@ -17,6 +19,7 @@ interface CloudflareIPsResponse {
 interface StoredCloudflareIPs {
     ipv4_cidrs: string[];
     cm_cidrs: string[];
+    custom_ipv4_cidrs?: string[];
     etag: string;
 }
 
@@ -32,7 +35,10 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
     const { env } = context;
     try {
         const cached = await env.IP_KV.get<StoredCloudflareIPs>("CF_IPS_DATA", "json");
-        return jsonResponse(cached || null);
+        return jsonResponse(cached ? {
+            ...cached,
+            custom_ipv4_cidrs: cached.custom_ipv4_cidrs || [],
+        } : null);
     } catch (e) {
         return jsonResponse({ message: (e as Error).message }, 500);
     }
@@ -67,6 +73,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
             const result = {
                 ipv4_cidrs: data.result.ipv4_cidrs,
                 cm_cidrs: cmCidrs,
+                custom_ipv4_cidrs: cached?.custom_ipv4_cidrs || [],
                 etag: data.result.etag
             };
             await env.IP_KV.put("CF_IPS_DATA", JSON.stringify(result));
@@ -77,3 +84,33 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
         return jsonResponse({ message: (e as Error).message }, 500);
     }
 }
+
+export const onRequestPatch: PagesFunction<Env> = async (context) => {
+    const { request, env } = context;
+    try {
+        const body = await request.json() as { custom_ipv4_cidrs?: unknown };
+        if (!Array.isArray(body.custom_ipv4_cidrs) || body.custom_ipv4_cidrs.length > 500) {
+            return jsonResponse({ message: '自定义网段格式无效' }, 400);
+        }
+
+        const normalized: string[] = [];
+        for (const value of body.custom_ipv4_cidrs) {
+            if (typeof value !== 'string') return jsonResponse({ message: '自定义网段必须是 IPv4 或 CIDR 文本' }, 400);
+            const cidr = normalizeIpv4Cidr(value);
+            if (!cidr) return jsonResponse({ message: `无效的 IPv4/CIDR: ${value}` }, 400);
+            normalized.push(cidr);
+        }
+
+        const cached = await env.IP_KV.get<StoredCloudflareIPs>('CF_IPS_DATA', 'json');
+        const updated: StoredCloudflareIPs = {
+            ipv4_cidrs: cached?.ipv4_cidrs || [],
+            cm_cidrs: cached?.cm_cidrs || [],
+            etag: cached?.etag || '',
+            custom_ipv4_cidrs: Array.from(new Set(normalized)),
+        };
+        await env.IP_KV.put('CF_IPS_DATA', JSON.stringify(updated));
+        return jsonResponse(updated);
+    } catch (error) {
+        return jsonResponse({ message: (error as Error).message }, 500);
+    }
+};

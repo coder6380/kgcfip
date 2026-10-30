@@ -66,7 +66,7 @@ export async function resolveDomainToIp(host: string, signal?: AbortSignal): Pro
 // 1. 地区分组逻辑 (源于参考代码)
 // =================================================================
 
-export { coloMap, getColoName } from './colo';
+export { coloMap, getColoName } from './colo.ts';
 
 // =================================================================
 // 2. IP 测速逻辑 (源于参考代码)
@@ -233,7 +233,7 @@ export async function measureIpLatency(
         if (!hexIp) throw new Error('无效的 IPv4 地址');
 
         const testUrl = `https://${hexIp}.ns.psb.kdns.fr:${port}/ip.json?_t=${Date.now()}`;
-        const fetchWithTimeout = async (method: 'OPTIONS' | 'GET', requestTimeout: number) => {
+        const fetchWithTimeout = async (requestTimeout: number) => {
             const requestController = new AbortController();
             const abortRequest = () => requestController.abort();
             controller.signal.addEventListener('abort', abortRequest, { once: true });
@@ -246,11 +246,13 @@ export async function measureIpLatency(
             }, requestTimeout);
 
             try {
-                return await fetch(testUrl, {
-                    method,
+                const response = await fetch(testUrl, {
                     signal: requestController.signal,
                     cache: 'no-store',
                 });
+                const responseAt = performance.now();
+                const body = await response.arrayBuffer();
+                return { status: response.status, body, responseAt };
             } catch (error) {
                 if (requestTimedOut) throw new Error('连接超时');
                 throw error;
@@ -260,28 +262,18 @@ export async function measureIpLatency(
             }
         };
 
-        // Warm the same endpoint before timing the GET request.
-        let lastOptionsError: unknown;
-        let optionsSucceeded = false;
-        for (let attempt = 0; attempt < 3; attempt++) {
-            if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
-            try {
-                const optionsResponse = await fetchWithTimeout('OPTIONS', timeout * 2);
-                if (optionsResponse.ok) {
-                    optionsSucceeded = true;
-                    break;
-                }
-                lastOptionsError = new Error(`OPTIONS HTTP ${optionsResponse.status}`);
-            } catch (error) {
-                if (signal?.aborted) throw error;
-                lastOptionsError = error;
-            }
+        if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
+        // 用 GET 预热复用连接，避免显式 OPTIONS 触发浏览器 CORS 预检。
+        const warmResponse = await fetchWithTimeout(timeout);
+        if (warmResponse.status !== 200) {
+            const error = `HTTP ${warmResponse.status}`;
+            return { latency: -1, colo: error, error };
         }
-        if (!optionsSucceeded) throw lastOptionsError || new Error('OPTIONS 不可用');
 
         if (controller.signal.aborted) throw new DOMException('测速已停止', 'AbortError');
         const requestStart = performance.now();
-        const response = await fetchWithTimeout('GET', timeout);
+        const response = await fetchWithTimeout(timeout);
+        const latency = Math.max(1, Math.round(response.responseAt - requestStart));
 
         if (response.status !== 200) {
             const error = `HTTP ${response.status}`;
@@ -290,11 +282,10 @@ export async function measureIpLatency(
 
         let data: { colo?: string } = {};
         try {
-            data = await response.json() as { colo?: string };
+            data = JSON.parse(new TextDecoder().decode(response.body)) as { colo?: string };
         } catch {
             // The response body is small metadata; keep the measured HTTP response if it is malformed.
         }
-        const latency = Math.max(1, Math.round(performance.now() - requestStart));
 
         return { latency, colo: data?.colo || '-' };
 
@@ -347,6 +338,7 @@ export class BatchScanner {
     private onComplete: (results: ScanResult[]) => void;
     private abortController: AbortController;
     private targetAvailableCount?: number;
+    private targetMatcher?: (result: ScanResult) => boolean;
     // 解析出的测速IP映射：key 为 "host:port"，value 为实际用于测速的IP（域名解析后）
     private resolvedMap?: Record<string, string | null>;
     private paused = false;
@@ -361,6 +353,7 @@ export class BatchScanner {
         onComplete: (results: ScanResult[]) => void,
         resolvedMap?: Record<string, string | null>,
         targetAvailableCount?: number,
+        targetMatcher?: (result: ScanResult) => boolean,
     ) {
         this.ips = ips;
         this.port = port;
@@ -371,6 +364,7 @@ export class BatchScanner {
         this.abortController = new AbortController();
         this.resolvedMap = resolvedMap;
         this.targetAvailableCount = targetAvailableCount;
+        this.targetMatcher = targetMatcher;
     }
 
     public stop() {
@@ -479,7 +473,7 @@ export class BatchScanner {
 
                 finalResults.push(result);
                 this.onProgress(result);
-                if (result.isAvailable) {
+                if (result.isAvailable && (!this.targetMatcher || this.targetMatcher(result))) {
                     availableCount++;
                     if (this.targetAvailableCount !== undefined && availableCount >= this.targetAvailableCount) {
                         this.abortController.abort();
