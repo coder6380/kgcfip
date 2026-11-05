@@ -1,7 +1,8 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { CloudflareIps, getCloudflareIps, saveCustomIpCidrs, syncCloudflareIps } from '../api';
-import { Cloud, RotateCw, Plus, Trash2 } from 'lucide-react';
-import { normalizeIpv4Cidr } from '../utils/ipRange';
+import { Cloud, RotateCw, Save } from 'lucide-react';
+import { parseIpv4CidrList } from '../utils/ipRange';
+import { toggleLineComments } from '../utils/textEditor';
 import { useToast } from './Toast';
 
 interface CloudflareIpListProps {
@@ -24,7 +25,10 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
             try {
                 const cfData = await getCloudflareIps();
                 setCfIps(cfData);
-                if (cfData) onDataLoaded(cfData);
+                if (cfData) {
+                    setCustomCidrInput(cfData.custom_ipv4_cidr_text ?? (cfData.custom_ipv4_cidrs || []).join('\n'));
+                    onDataLoaded(cfData);
+                }
                 setLoading(false);
                 return;
             } catch (err) {
@@ -54,10 +58,10 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
         }
     };
 
-    const persistCustomCidrs = async (nextCidrs: string[]) => {
+    const persistCustomCidrs = async (nextCidrs: string[], sourceText: string) => {
         setIsSavingCustom(true);
         try {
-            const data = await saveCustomIpCidrs(nextCidrs);
+            const data = await saveCustomIpCidrs(nextCidrs, sourceText);
             setCfIps(data);
             onDataLoaded(data);
             return true;
@@ -70,25 +74,41 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
         }
     };
 
-    const handleAddCustomCidr = async (event: FormEvent<HTMLFormElement>) => {
+    const handleSaveCustomCidrs = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
-        const cidr = normalizeIpv4Cidr(customCidrInput);
-        if (!cidr) {
-            showToast('请输入有效 IPv4 地址或 CIDR，例如 203.0.113.0/24', 'warning');
+        const { cidrs, invalidEntries, duplicateCount } = parseIpv4CidrList(customCidrInput);
+
+        if (invalidEntries.length > 0) {
+            showToast(`有 ${invalidEntries.length} 项格式无效，请修正后再保存`, 'warning');
             return;
         }
 
-        const customCidrs = cfIps?.custom_ipv4_cidrs || [];
-        if (customCidrs.includes(cidr)) {
-            showToast('该 IP 段已经添加', 'warning');
+        if (cidrs.length > 500) {
+            showToast('自定义网段最多保存 500 段', 'warning');
             return;
         }
-        if (await persistCustomCidrs([...customCidrs, cidr])) setCustomCidrInput('');
+
+        if (!await persistCustomCidrs(cidrs, customCidrInput)) return;
+
+        const message = duplicateCount
+            ? `已保存 ${cidrs.length} 段，跳过重复 ${duplicateCount} 项`
+            : `已保存 ${cidrs.length} 段`;
+        showToast(message, 'success');
     };
 
-    const handleDeleteCustomCidr = async (cidr: string) => {
-        const customCidrs = cfIps?.custom_ipv4_cidrs || [];
-        await persistCustomCidrs(customCidrs.filter(item => item !== cidr));
+    const handleCustomCidrKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+        const isSlashKey = event.code === 'Slash' || event.key === '/' || event.key === '?';
+        if (!event.ctrlKey || !isSlashKey || event.repeat) return;
+
+        event.preventDefault();
+        const textarea = event.currentTarget;
+        const result = toggleLineComments(customCidrInput, textarea.selectionStart, textarea.selectionEnd);
+        if (!result) return;
+
+        setCustomCidrInput(result.text);
+        requestAnimationFrame(() => {
+            textarea.setSelectionRange(result.selectionStart, result.selectionEnd, textarea.selectionDirection || 'none');
+        });
     };
 
     useEffect(() => {
@@ -153,53 +173,47 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
 
             <div className="pt-4" role="tabpanel">
                 {activeTab === 'custom' && (
-                    <form onSubmit={handleAddCustomCidr} className="mb-4 flex flex-col gap-2 sm:flex-row">
-                        <label htmlFor="custom-ip-cidr" className="sr-only">自定义 IPv4 或 CIDR</label>
-                        <input
+                    <form onSubmit={handleSaveCustomCidrs} className="mb-4 space-y-3">
+                        <label htmlFor="custom-ip-cidr" className="sr-only">编辑自定义 IPv4 网段</label>
+                        <textarea
                             id="custom-ip-cidr"
-                            type="text"
                             value={customCidrInput}
                             onChange={event => setCustomCidrInput(event.target.value)}
-                            placeholder="203.0.113.0/24 或 203.0.113.10"
+                            onKeyDown={handleCustomCidrKeyDown}
+                            placeholder={'每行一个 IPv4 地址或 CIDR，例如：\n203.0.113.0/24\n198.51.100.0/24\n# 以 # 开头的行不会扫描'}
                             disabled={loading || isSavingCustom}
-                            className="h-10 min-w-0 flex-1 rounded-md border border-gray-300 bg-white px-3 font-mono text-sm text-gray-800 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
+                            rows={12}
+                            className="block max-h-96 min-h-60 w-full resize-y rounded-md border border-gray-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 text-gray-800 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
                         />
-                        <button
-                            type="submit"
-                            disabled={loading || isSavingCustom || !customCidrInput.trim()}
-                            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-sky-700 px-4 text-sm font-semibold text-white transition-colors hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
-                        >
-                            <Plus className="h-4 w-4" />
-                            添加网段
-                        </button>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <p className="min-w-0 flex-1 text-xs leading-5 text-gray-500 dark:text-gray-400">
+                                已保存 {customCidrs.length} 段。删除行后保存即可批量删除；# 注释行不会扫描。选中多行按 Ctrl + / 注释或恢复。
+                            </p>
+                            <button
+                                type="submit"
+                                disabled={loading || isSavingCustom}
+                                className="inline-flex h-10 flex-none items-center justify-center gap-2 rounded-md bg-sky-700 px-4 text-sm font-semibold text-white transition-colors hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+                            >
+                                <Save className="h-4 w-4" />
+                                {isSavingCustom ? '保存中' : '保存网段'}
+                            </button>
+                        </div>
                     </form>
                 )}
 
-                {visibleCidrs.length > 0 ? (
+                {activeTab !== 'custom' && visibleCidrs.length > 0 ? (
                     <ul className="max-h-52 divide-y divide-gray-100 overflow-y-auto pr-1 dark:divide-gray-700">
                         {visibleCidrs.map(cidr => (
                             <li key={cidr} className="flex min-h-10 items-center justify-between gap-3 py-1.5">
                                 <code className="min-w-0 break-all text-sm text-gray-700 dark:text-gray-200">{cidr}</code>
-                                {activeTab === 'custom' && (
-                                    <button
-                                        type="button"
-                                        onClick={() => void handleDeleteCustomCidr(cidr)}
-                                        disabled={loading || isSavingCustom}
-                                        aria-label={`删除 ${cidr}`}
-                                        title={`删除 ${cidr}`}
-                                        className="flex h-8 w-8 flex-none items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-red-50 hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-900/30 dark:hover:text-red-300"
-                                    >
-                                        <Trash2 className="h-4 w-4" />
-                                    </button>
-                                )}
                             </li>
                         ))}
                     </ul>
-                ) : (
+                ) : activeTab !== 'custom' ? (
                     <p className="py-5 text-center text-sm text-gray-500 dark:text-gray-400">
-                        {activeTab === 'custom' ? '还没有自定义网段' : loading ? '正在加载网段…' : '暂无网段数据'}
+                        {loading ? '正在加载网段…' : '暂无网段数据'}
                     </p>
-                )}
+                ) : null}
             </div>
         </section>
     );

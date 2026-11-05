@@ -1,4 +1,4 @@
-import { normalizeIpv4Cidr } from '../../src/utils/ipRange.ts';
+import { normalizeIpv4Cidr, parseIpv4CidrList } from '../../src/utils/ipRange.ts';
 
 interface Env {
     IP_KV: KVNamespace;
@@ -20,6 +20,7 @@ interface StoredCloudflareIPs {
     ipv4_cidrs: string[];
     cm_cidrs: string[];
     custom_ipv4_cidrs?: string[];
+    custom_ipv4_cidr_text?: string;
     etag: string;
 }
 
@@ -38,6 +39,7 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
         return jsonResponse(cached ? {
             ...cached,
             custom_ipv4_cidrs: cached.custom_ipv4_cidrs || [],
+            custom_ipv4_cidr_text: cached.custom_ipv4_cidr_text ?? (cached.custom_ipv4_cidrs || []).join('\n'),
         } : null);
     } catch (e) {
         return jsonResponse({ message: (e as Error).message }, 500);
@@ -74,6 +76,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
                 ipv4_cidrs: data.result.ipv4_cidrs,
                 cm_cidrs: cmCidrs,
                 custom_ipv4_cidrs: cached?.custom_ipv4_cidrs || [],
+                custom_ipv4_cidr_text: cached?.custom_ipv4_cidr_text ?? (cached?.custom_ipv4_cidrs || []).join('\n'),
                 etag: data.result.etag
             };
             await env.IP_KV.put("CF_IPS_DATA", JSON.stringify(result));
@@ -88,17 +91,38 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 export const onRequestPatch: PagesFunction<Env> = async (context) => {
     const { request, env } = context;
     try {
-        const body = await request.json() as { custom_ipv4_cidrs?: unknown };
-        if (!Array.isArray(body.custom_ipv4_cidrs) || body.custom_ipv4_cidrs.length > 500) {
-            return jsonResponse({ message: '自定义网段格式无效' }, 400);
+        const body = await request.json() as { custom_ipv4_cidrs?: unknown; custom_ipv4_cidr_text?: unknown };
+        let normalized: string[];
+        let sourceText: string;
+
+        if (body.custom_ipv4_cidr_text !== undefined) {
+            if (typeof body.custom_ipv4_cidr_text !== 'string' || body.custom_ipv4_cidr_text.length > 100_000) {
+                return jsonResponse({ message: '自定义网段文本无效或超过长度限制' }, 400);
+            }
+            sourceText = body.custom_ipv4_cidr_text;
+            const parsed = parseIpv4CidrList(sourceText);
+            if (parsed.invalidEntries.length > 0) {
+                return jsonResponse({ message: `无效的 IPv4/CIDR: ${parsed.invalidEntries[0]}` }, 400);
+            }
+            normalized = parsed.cidrs;
+        } else {
+            if (!Array.isArray(body.custom_ipv4_cidrs) || body.custom_ipv4_cidrs.length > 500) {
+                return jsonResponse({ message: '自定义网段格式无效' }, 400);
+            }
+
+            normalized = [];
+            for (const value of body.custom_ipv4_cidrs) {
+                if (typeof value !== 'string') return jsonResponse({ message: '自定义网段必须是 IPv4 或 CIDR 文本' }, 400);
+                const cidr = normalizeIpv4Cidr(value);
+                if (!cidr) return jsonResponse({ message: `无效的 IPv4/CIDR: ${value}` }, 400);
+                normalized.push(cidr);
+            }
+            normalized = Array.from(new Set(normalized));
+            sourceText = normalized.join('\n');
         }
 
-        const normalized: string[] = [];
-        for (const value of body.custom_ipv4_cidrs) {
-            if (typeof value !== 'string') return jsonResponse({ message: '自定义网段必须是 IPv4 或 CIDR 文本' }, 400);
-            const cidr = normalizeIpv4Cidr(value);
-            if (!cidr) return jsonResponse({ message: `无效的 IPv4/CIDR: ${value}` }, 400);
-            normalized.push(cidr);
+        if (normalized.length > 500) {
+            return jsonResponse({ message: '自定义网段最多保存 500 段' }, 400);
         }
 
         const cached = await env.IP_KV.get<StoredCloudflareIPs>('CF_IPS_DATA', 'json');
@@ -106,7 +130,8 @@ export const onRequestPatch: PagesFunction<Env> = async (context) => {
             ipv4_cidrs: cached?.ipv4_cidrs || [],
             cm_cidrs: cached?.cm_cidrs || [],
             etag: cached?.etag || '',
-            custom_ipv4_cidrs: Array.from(new Set(normalized)),
+            custom_ipv4_cidrs: normalized,
+            custom_ipv4_cidr_text: sourceText,
         };
         await env.IP_KV.put('CF_IPS_DATA', JSON.stringify(updated));
         return jsonResponse(updated);

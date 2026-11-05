@@ -4,6 +4,7 @@ export interface CloudflareIps {
     ipv4_cidrs: string[];
     cm_cidrs: string[];
     custom_ipv4_cidrs?: string[];
+    custom_ipv4_cidr_text?: string;
     etag?: string;
 }
 
@@ -105,11 +106,11 @@ export async function syncCloudflareIps(): Promise<CloudflareIps> {
     return handleResponse<CloudflareIps>(response);
 }
 
-export async function saveCustomIpCidrs(cidrs: string[]): Promise<CloudflareIps> {
+export async function saveCustomIpCidrs(cidrs: string[], sourceText?: string): Promise<CloudflareIps> {
     const response = await authedFetch('/api/cf_ips', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ custom_ipv4_cidrs: cidrs }),
+        body: JSON.stringify({ custom_ipv4_cidrs: cidrs, custom_ipv4_cidr_text: sourceText }),
     });
     return handleResponse<CloudflareIps>(response);
 }

@@ -41,3 +41,17 @@ export function normalizeIpv4Cidr(value: string): string | null {
 
     return `${formatIpv4(networkOctets)}/${prefix}`;
 }
+
+export function parseIpv4CidrList(text: string) {
+    const entries = text
+        .split(/\r?\n/)
+        .flatMap(line => line.split('#', 1)[0].split(/[\s,;]+/).filter(Boolean));
+    const normalizedEntries = entries.map(entry => normalizeIpv4Cidr(entry));
+    const cidrs = [...new Set(normalizedEntries.filter((cidr): cidr is string => cidr !== null))];
+
+    return {
+        cidrs,
+        invalidEntries: entries.filter((_, index) => normalizedEntries[index] === null),
+        duplicateCount: normalizedEntries.filter((cidr): cidr is string => cidr !== null).length - cidrs.length,
+    };
+}

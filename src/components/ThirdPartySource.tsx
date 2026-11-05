@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type KeyboardEvent } from 'react';
 import { Globe, Save } from 'lucide-react';
 import { useToast } from './Toast';
 import { getThirdPartySources, saveThirdPartySources } from '../api';
+import { toggleLineComments } from '../utils/textEditor';
 
 const LINE_HEIGHT = 24;
 
@@ -12,6 +13,21 @@ export function ThirdPartySource() {
     const [scrollTop, setScrollTop] = useState(0);
     const taRef = useRef<HTMLTextAreaElement>(null);
     const { showToast } = useToast();
+
+    const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+        const isSlashKey = event.code === 'Slash' || event.key === '/' || event.key === '?';
+        if (!event.ctrlKey || !isSlashKey || event.repeat) return;
+
+        event.preventDefault();
+        const textarea = event.currentTarget;
+        const result = toggleLineComments(urls, textarea.selectionStart, textarea.selectionEnd);
+        if (!result) return;
+
+        setUrls(result.text);
+        requestAnimationFrame(() => {
+            textarea.setSelectionRange(result.selectionStart, result.selectionEnd, textarea.selectionDirection || 'none');
+        });
+    };
 
     useEffect(() => {
         const loadSources = async () => {
@@ -101,6 +117,7 @@ export function ThirdPartySource() {
                         ref={taRef}
                         value={urls}
                         onChange={(e) => setUrls(e.target.value)}
+                        onKeyDown={handleKeyDown}
                         onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
                         placeholder="请输入接口地址，例如：&#10;https://api.example.com/ips&#10;https://other.source/list"
                         className="relative w-full h-full pb-2 pl-3 pr-3 border-0 bg-transparent dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none resize-none overflow-auto transition-colors"
@@ -109,6 +126,9 @@ export function ThirdPartySource() {
                     />
                 </div>
             </div>
+            <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                选中多行按 Ctrl + / 批量注释或恢复；以 # 开头的行会跳过读取。
+            </p>
         </div>
     );
 }

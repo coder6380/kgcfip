@@ -8,8 +8,10 @@ import {
   measureIpLatency,
 } from '../utils/scanner';
 import { useToast } from './Toast';
-import { Gauge, ListFilter, RefreshCw, Save, StopCircle } from 'lucide-react';
+import { Copy, Gauge, ListFilter, RefreshCw, Save, StopCircle } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
+import { getColoName } from '../utils/colo';
+import { formatIpTextLine } from '../utils/ipTextFormat';
 
 interface IpScannerResultsAndSaveProps {
     scanResults: ScanResult[];
@@ -232,6 +234,32 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         && limitedResults.every(result => selectedResults.has(getResultKey(result)));
 
     const { showToast } = useToast();
+
+    const handleCopyResults = async () => {
+        if (sortedResults.length === 0) {
+            showToast('没有可复制的数据', 'warning');
+            return;
+        }
+
+        const text = sortedResults.map(result => {
+            const regionName = getColoName(result.colo || '').replace(/^(\p{Regional_Indicator}+)\s+/u, '$1');
+            return formatIpTextLine({
+                ip: result.ip,
+                port: result.port,
+                alias: regionName,
+                latency: result.latency,
+                downloadSpeedMBps: getResultDownloadSpeed(result),
+            });
+        }).join('\n') + '\n';
+
+        try {
+            await navigator.clipboard.writeText(text);
+            showToast('已复制到剪贴板', 'success');
+        } catch (error) {
+            console.error('Failed to copy scan results:', error);
+            showToast('复制失败，请检查浏览器权限', 'error');
+        }
+    };
 
     useEffect(() => () => {
         downloadControllerRef.current?.abort();
@@ -712,6 +740,15 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     测延迟 ({latencyTestTargets.length})
                                 </button>
                             )}
+                            <button
+                                type="button"
+                                onClick={() => void handleCopyResults()}
+                                disabled={sortedResults.length === 0}
+                                className="flex items-center gap-2 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-600"
+                            >
+                                <Copy className="h-4 w-4" />
+                                复制结果 ({sortedResults.length})
+                            </button>
                         </div>
                         {(isDownloadTesting || downloadTestMessage || isLatencyTesting || latencyTestMessage) && (
                             <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-gray-600 dark:text-gray-300" aria-live="polite">
