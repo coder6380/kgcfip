@@ -1,4 +1,6 @@
 // e:\CODE\kgcfip\src\utils\scanner.ts
+import { normalizeIpv4Cidr } from './ipRange.ts';
+
 /**
  * 扫描结果的数据结构
  */
@@ -342,8 +344,100 @@ export async function probeBrowserAvailable(sampleIps?: string[], attempts = 10)
 // 3. 批量扫描器和 IP 生成器
 // =================================================================
 
+export interface ScanCandidateSource {
+    readonly total: number;
+    next(): string | undefined;
+}
+
+interface Ipv4Range {
+    start: number;
+    end: number;
+    cumulativeStart: number;
+    cumulativeEnd: number;
+}
+
+function ipv4ToNumber(ip: string): number {
+    return ip.split('.').reduce((value, octet) => value * 256 + Number(octet), 0);
+}
+
+function numberToIpv4(value: number): string {
+    return [
+        Math.floor(value / 16777216),
+        Math.floor(value / 65536) % 256,
+        Math.floor(value / 256) % 256,
+        value % 256,
+    ].join('.');
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+    while (right !== 0) {
+        [left, right] = [right, left % right];
+    }
+    return left;
+}
+
+/** Creates a randomized, duplicate-free traversal of every address in the CIDRs. */
+export function createRandomIpv4CandidatePool(cidrs: string[]): ScanCandidateSource {
+    const blocks = cidrs.flatMap(cidr => {
+        const normalized = normalizeIpv4Cidr(cidr);
+        if (!normalized) return [];
+
+        const [network, prefixText] = normalized.split('/');
+        const start = ipv4ToNumber(network);
+        const size = 2 ** (32 - Number(prefixText));
+        return [{ start, end: start + size - 1 }];
+    }).sort((left, right) => left.start - right.start || left.end - right.end);
+
+    const merged: { start: number; end: number }[] = [];
+    for (const block of blocks) {
+        const previous = merged[merged.length - 1];
+        if (previous && block.start <= previous.end + 1) {
+            previous.end = Math.max(previous.end, block.end);
+        } else {
+            merged.push({ ...block });
+        }
+    }
+
+    let total = 0;
+    const ranges: Ipv4Range[] = merged.map(({ start, end }) => {
+        const cumulativeStart = total;
+        total += end - start + 1;
+        return { start, end, cumulativeStart, cumulativeEnd: total };
+    });
+
+    let ordinal = total > 0 ? Math.floor(Math.random() * total) : 0;
+    let step = 1;
+    if (total > 1) {
+        step = 1 + Math.floor(Math.random() * (total - 1));
+        while (greatestCommonDivisor(step, total) !== 1) step = (step % (total - 1)) + 1;
+    }
+
+    let emitted = 0;
+    return {
+        total,
+        next() {
+            if (emitted >= total) return undefined;
+            let low = 0;
+            let high = ranges.length - 1;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (ordinal < ranges[middle].cumulativeEnd) high = middle;
+                else low = middle + 1;
+            }
+
+            const range = ranges[low];
+            const address = range.start + ordinal - range.cumulativeStart;
+            emitted++;
+            ordinal = (ordinal + step) % total;
+            return numberToIpv4(address);
+        },
+    };
+}
+
 export class BatchScanner {
-    private ips: string[];
+    private candidates: string[] | ScanCandidateSource;
+    private candidateCount: number;
+    private candidateIndex = 0;
     private port: number;
     private threads: number;
     private latencyLimit: number;
@@ -358,7 +452,7 @@ export class BatchScanner {
     private resumeResolvers: Array<() => void> = [];
 
     constructor(
-        ips: string[],
+        candidates: string[] | ScanCandidateSource,
         port: number,
         threads: number,
         latencyLimit: number,
@@ -368,9 +462,10 @@ export class BatchScanner {
         targetAvailableCount?: number,
         targetMatcher?: (result: ScanResult) => boolean,
     ) {
-        this.ips = ips;
+        this.candidates = candidates;
+        this.candidateCount = Array.isArray(candidates) ? candidates.length : candidates.total;
         this.port = port;
-        this.threads = Math.min(ips.length, threads);
+        this.threads = Math.min(this.candidateCount, threads);
         this.latencyLimit = latencyLimit;
         this.onProgress = onProgress;
         this.onComplete = onComplete;
@@ -422,13 +517,12 @@ export class BatchScanner {
     }
 
     public async run() {
-        const queue = [...this.ips];
         const finalResults: ScanResult[] = [];
         let availableCount = 0;
         const requestTimeout = Math.max(1, Math.min(this.latencyLimit, BROWSER_LATENCY_TIMEOUT_MS));
 
         const worker = async () => {
-            while (queue.length > 0) {
+            while (true) {
                 if (this.abortController.signal.aborted) break;
                 if (this.paused) {
                     await new Promise<void>((resolve) => { this.resumeResolvers.push(resolve); });
@@ -436,8 +530,10 @@ export class BatchScanner {
                     continue;
                 }
 
-                const rawTarget = queue.shift();
-                if (!rawTarget) continue;
+                const rawTarget = Array.isArray(this.candidates)
+                    ? this.candidates[this.candidateIndex++]
+                    : this.candidates.next();
+                if (rawTarget === undefined) break;
 
                 const { host, port } = this.parseTarget(rawTarget);
 
@@ -459,7 +555,6 @@ export class BatchScanner {
                             colo: 'ResolveFail',
                             domain: true,
                         };
-                        finalResults.push(fail);
                         this.onProgress(fail);
                         continue;
                     }
@@ -484,9 +579,10 @@ export class BatchScanner {
                     domain: isDomain || undefined,
                 };
 
-                finalResults.push(result);
+                const matchesTarget = result.isAvailable && (!this.targetMatcher || this.targetMatcher(result));
+                if (matchesTarget) finalResults.push(result);
                 this.onProgress(result);
-                if (result.isAvailable && (!this.targetMatcher || this.targetMatcher(result))) {
+                if (matchesTarget) {
                     availableCount++;
                     if (this.targetAvailableCount !== undefined && availableCount >= this.targetAvailableCount) {
                         this.abortController.abort();
@@ -508,32 +604,7 @@ export class BatchScanner {
 }
 
 /**
- * 从 CIDR 块生成随机 IP
- */
-function generateRandomIPFromCIDR(cidr: string): string {
-    const [baseIP, prefixLength] = cidr.split('/');
-    const prefix = parseInt(prefixLength, 10);
-    
-    if (prefix === 32) return baseIP;
-
-    const hostBits = 32 - prefix;
-    const ipParts = baseIP.split('.').map(p => parseInt(p, 10));
-    
-    const ipInt = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
-    const randomOffset = Math.floor(Math.random() * (2 ** hostBits));
-    const mask = (0xFFFFFFFF << hostBits) >>> 0;
-    const randomIPInt = ((ipInt & mask) >>> 0) + randomOffset;
-    
-    return [
-        (randomIPInt >>> 24) & 0xFF,
-        (randomIPInt >>> 16) & 0xFF,
-        (randomIPInt >>> 8) & 0xFF,
-        randomIPInt & 0xFF
-    ].join('.');
-}
-
-/**
- * 从 CIDR 列表生成指定数量的随机 IP
+ * 从 CIDR 地址池随机、不重复地生成指定数量的 IP
  */
 export function generateRandomIps(
     cidrs: string[],
@@ -543,17 +614,14 @@ export function generateRandomIps(
     if (!cidrs || cidrs.length === 0 || count <= 0) {
         return [];
     }
-    const randomIps = new Set<string>();
-    const maxAttempts = count * 10;
-    let attempts = 0;
-
-    while (randomIps.size < count && attempts < maxAttempts) {
-        const randomCidr = cidrs[Math.floor(Math.random() * cidrs.length)];
-        const randomIp = generateRandomIPFromCIDR(randomCidr);
-        if (!excludedIps.has(randomIp)) randomIps.add(randomIp);
-        attempts++;
+    const pool = createRandomIpv4CandidatePool(cidrs);
+    const randomIps: string[] = [];
+    while (randomIps.length < count) {
+        const randomIp = pool.next();
+        if (randomIp === undefined) break;
+        if (!excludedIps.has(randomIp)) randomIps.push(randomIp);
     }
-    return Array.from(randomIps);
+    return randomIps;
 }
 
 // =================================================================
